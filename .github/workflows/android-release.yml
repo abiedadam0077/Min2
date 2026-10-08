@@ -143,6 +143,21 @@ jobs:
           (cd dist && sha256sum ./*.apk > SHA256SUMS.txt)
           ls -la dist
 
+      - name: Record the APK signing certificate SHA-1
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(find "${ANDROID_HOME}/build-tools" -name apksigner -type f | sort -V | tail -n 1)"
+          "$APKSIGNER" verify --print-certs dist/VoxelOps.apk > signing-certs.txt
+          SHA1="$(grep -m1 'SHA-1 digest' signing-certs.txt | sed 's/.*SHA-1 digest: *//' | tr -d ' ')"
+          test -n "$SHA1"
+          echo "Android OAuth client SHA-1 for this APK (package com.voxelops.app): ${SHA1}" > dist/SIGNING-CERT-SHA1.txt
+          {
+            echo "### Signing certificate"
+            echo "Register this SHA-1 in the Android OAuth client for com.voxelops.app:"
+            echo ""
+            echo "\`${SHA1}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v7
         with:
           name: voxelops-apk-${{ github.run_number }}
@@ -179,6 +194,7 @@ jobs:
             "" \
             "Install: download VoxelOps.apk and open it on an Android phone (Android 7.0 or newer)." \
             "Verify: compare the SHA-256 values in SHA256SUMS.txt." > "$NOTES_FILE"
+          if [ -f dist/SIGNING-CERT-SHA1.txt ]; then cat dist/SIGNING-CERT-SHA1.txt >> "$NOTES_FILE"; fi
           if OUTPUT=$(gh release create "$TAG" dist/VoxelOps.apk dist/SHA256SUMS.txt dist/VoxelOps-*.apk \
                 --target "$GITHUB_SHA" --title "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER})" \
                 --notes-file "$NOTES_FILE" --latest 2>&1); then
