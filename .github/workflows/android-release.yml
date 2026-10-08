@@ -47,6 +47,11 @@ jobs:
       - name: Annotate analyzer findings
         if: failure() && steps.analyze.outcome == 'failure'
         run: python3 tool/ci_annotate.py analyze analyze.log
+      - name: Runner compiles (Python 3 standard library)
+        run: |
+          python3 -m py_compile assets/runtime/voxelops_runner.py
+          python3 -m pyflakes --version >/dev/null 2>&1 || python3 -m pip install --quiet pyflakes
+          python3 -m pyflakes assets/runtime/voxelops_runner.py tool/ci_annotate.py tool/generate_icons.py
       - name: Unit and widget tests
         id: test
         if: always()
