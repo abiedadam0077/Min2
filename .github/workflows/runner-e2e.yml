@@ -1,0 +1,42 @@
+name: Runner end-to-end test
+
+on:
+  push:
+    branches:
+      - arena/1e2cf108-min2
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Minecraft on a GitHub-hosted runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run the scenario (real runner, real Minecraft, test-only Drive API)
+        run: python3 tests/e2e/run_e2e.py
+      - name: Keep runner logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runner-e2e-logs
+          path: ${{ runner.temp }}/voxelops-e2e
+          if-no-files-found: ignore
+          retention-days: 7

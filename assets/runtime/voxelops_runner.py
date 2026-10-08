@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""VoxelOps runner.
+"""VoxelOps runner (GitHub-hosted runner, Python standard library only).
 
-Runs one Minecraft server inside a GitHub Actions job and keeps Google Drive as the source of
-truth: it pulls the server folder on start, saves and pushes the world on a timer and before any
-stop, applies queued commands from the app, and dispatches a fresh run before the six-hour job
-limit. Standard library only, so no pip step is needed on the runner.
+The runner executes one Minecraft server inside a GitHub Actions job. Google Drive is the source of
+truth:
 
-This file is generated and committed by VoxelOps. Local edits are overwritten on refresh.
+* On start it pulls the server folder from Drive (atomic downloads, md5 verified).
+* While running it saves the world and uploads changed files on a timer.
+* Before a stop or restart it saves, uploads, creates a backup, stops Minecraft and uploads again.
+* It never deletes Drive files during a normal sync. Deletions happen only for an explicit restore,
+  and only after the restored world has been uploaded and verified.
+* Commands from the app arrive as small JSON files in _voxelops/control/commands.
+
+This file is generated and committed by VoxelOps. Local edits are overwritten on the next refresh.
 """
 
 import collections
@@ -28,27 +33,26 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 
-UA = "VoxelOps-Runner/1.0 (+https://github.com/abiedadam0077/Min2)"
-DRIVE = "https://www.googleapis.com/drive/v3"
-UPLOAD = "https://www.googleapis.com/upload/drive/v3"
-TOKEN_URL = "https://oauth2.googleapis.com/token"
+UA = "VoxelOps-Runner/1.1 (+https://github.com/abiedadam0077/Min2)"
+DRIVE = os.environ.get("VOXEL_DRIVE_API", "https://www.googleapis.com/drive/v3").rstrip("/")
+UPLOAD = os.environ.get("VOXEL_DRIVE_UPLOAD", "https://www.googleapis.com/upload/drive/v3").rstrip("/")
+TOKEN_URL = os.environ.get("VOXEL_TOKEN_URL", "https://oauth2.googleapis.com/token")
 FOLDER_MIME = "application/vnd.google-apps.folder"
 CHUNK = 8 * 1024 * 1024
 MULTIPART_LIMIT = 4 * 1024 * 1024
+SYSTEM_DIR = "_voxelops"
 WORLD_DIRS = ["world", "world_nether", "world_the_end"]
-MIRROR_DIRS = WORLD_DIRS + ["mods", "plugins", "config"]
+SYNC_DIRS = WORLD_DIRS + ["mods", "plugins", "config"]
 TOP_FILES = ["server.properties", "eula.txt", "server-icon.png"]
 ROOT = os.path.abspath(os.environ.get("VOXEL_WORKDIR", "minecraft"))
 TMP = tempfile.mkdtemp(prefix="voxelops-")
 LOG_LINES = collections.deque(maxlen=400)
 LOG_LOCK = threading.Lock()
+IP_PATTERN = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
-
-
-IP_PATTERN = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 
 def redact(text):
@@ -57,7 +61,7 @@ def redact(text):
 
 
 def log(message):
-    line = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {redact(message)}"
+    line = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {redact(str(message))}"
     print(line, flush=True)
     with LOG_LOCK:
         LOG_LINES.append(line)
@@ -71,7 +75,7 @@ def env(name, default=None, required=False):
 
 
 class HttpError(Exception):
-    def __init__(self, status, body):
+    def __init__(self, status, body=b""):
         super().__init__(f"HTTP {status}")
         self.status = status
         self.body = body
@@ -85,11 +89,17 @@ def http(method, url, data=None, headers=None, timeout=120, stream_to=None):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if stream_to:
-                with open(stream_to, "wb") as fh:
+                tmp_path = stream_to + ".part"
+                os.makedirs(os.path.dirname(stream_to) or ".", exist_ok=True)
+                with open(tmp_path, "wb") as fh:
                     shutil.copyfileobj(resp, fh, CHUNK)
+                os.replace(tmp_path, stream_to)
                 return resp.status, dict(resp.headers), b""
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as err:
+        if err.code == 308:
+            # "Resume Incomplete" is part of the resumable upload protocol, not a redirect.
+            return 308, dict(err.headers), err.read()
         raise HttpError(err.code, err.read()[:2000]) from None
 
 
@@ -112,22 +122,33 @@ def retry(fn, attempts=5):
             raise
 
 
+def md5_of(path):
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class Drive:
+    """Minimal Google Drive v3 client: listing, folders, downloads, multipart and resumable uploads."""
+
     def __init__(self):
         self.client_id = env("GDRIVE_CLIENT_ID", required=True)
         self.refresh_token = env("GDRIVE_REFRESH_TOKEN", required=True)
         self._token = None
         self._expires = 0.0
 
-    def _access(self):
-        if self._token and time.time() < self._expires - 60:
+    def _access(self, force=False):
+        if self._token and not force and time.time() < self._expires - 60:
             return self._token
         body = urllib.parse.urlencode({
             "client_id": self.client_id,
             "refresh_token": self.refresh_token,
             "grant_type": "refresh_token",
         }).encode()
-        _, _, raw = retry(lambda: http("POST", TOKEN_URL, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}))
+        _, _, raw = retry(lambda: http("POST", TOKEN_URL, data=body,
+                                       headers={"Content-Type": "application/x-www-form-urlencoded"}))
         payload = json.loads(raw.decode())
         self._token = payload["access_token"]
         self._expires = time.time() + int(payload.get("expires_in", 3000))
@@ -170,7 +191,8 @@ class Drive:
         clauses = [f"'{self._q(parent)}' in parents", f"name = '{self._q(name)}'", "trashed = false"]
         if folder is True:
             clauses.append(f"mimeType = '{FOLDER_MIME}'")
-        params = {"q": " and ".join(clauses), "pageSize": "5", "fields": "files(id,name,mimeType,md5Checksum,size,modifiedTime)"}
+        params = {"q": " and ".join(clauses), "pageSize": "5",
+                  "fields": "files(id,name,mimeType,md5Checksum,size,modifiedTime)"}
         files = self.json_call("GET", f"{DRIVE}/files?{urllib.parse.urlencode(params)}").get("files", [])
         return files[0] if files else None
 
@@ -178,13 +200,13 @@ class Drive:
         found = self.find(parent, name, folder=True)
         if found:
             return found["id"]
-        created = self.json_call("POST", f"{DRIVE}/files?fields=id", {"name": name, "mimeType": FOLDER_MIME, "parents": [parent]})
+        created = self.json_call("POST", f"{DRIVE}/files?fields=id",
+                                 {"name": name, "mimeType": FOLDER_MIME, "parents": [parent]})
         return created["id"]
 
     def download_to(self, file_id, path):
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         url = f"{DRIVE}/files/{file_id}?alt=media"
-        retry(lambda: http("GET", url, headers=self._auth(), timeout=600, stream_to=path))
+        retry(lambda: http("GET", url, headers=self._auth(), timeout=900, stream_to=path))
 
     def download_bytes(self, file_id):
         url = f"{DRIVE}/files/{file_id}?alt=media"
@@ -201,12 +223,11 @@ class Drive:
             return None
 
     def write_bytes(self, parent, name, data, mime, file_id=None):
-        """Create or replace a file. Uses multipart for small payloads, resumable otherwise."""
+        if isinstance(data, str):
+            data = data.encode()
         if file_id is None:
             existing = self.find(parent, name)
             file_id = existing["id"] if existing else None
-        if isinstance(data, str):
-            data = data.encode()
         if len(data) <= MULTIPART_LIMIT:
             return self._simple_write(parent, name, data, mime, file_id)
         return self._resumable(parent, name, mime, file_id, len(data), lambda s, e: data[s:e])
@@ -229,9 +250,10 @@ class Drive:
     def _simple_write(self, parent, name, data, mime, file_id):
         if file_id:
             url = f"{UPLOAD}/files/{file_id}?uploadType=media&fields=id,md5Checksum"
-            _, _, raw = retry(lambda: http("PATCH", url, data=data, headers=self._auth({"Content-Type": mime}), timeout=300))
+            _, _, raw = retry(lambda: http("PATCH", url, data=data,
+                                           headers=self._auth({"Content-Type": mime}), timeout=300))
             return json.loads(raw.decode())
-        boundary = "voxelops" + str(random.randrange(10**12))
+        boundary = "voxelops" + str(random.randrange(10 ** 12))
         meta = json.dumps({"name": name, "parents": [parent], "mimeType": mime}).encode()
         body = b"".join([
             f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode(), meta,
@@ -255,8 +277,8 @@ class Drive:
                               "X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(total)})
         req = urllib.request.Request(url, data=meta, method=method)
         req.add_header("User-Agent", UA)
-        for k, v in headers.items():
-            req.add_header(k, v)
+        for key, value in headers.items():
+            req.add_header(key, value)
         with urllib.request.urlopen(req, timeout=120) as resp:
             location = resp.headers.get("Location")
         if not location:
@@ -265,17 +287,19 @@ class Drive:
         while True:
             end = min(offset + CHUNK, total)
             chunk = read_chunk(offset, end) if total else b""
-            put_headers = {"Content-Range": f"bytes {offset}-{end - 1}/{total}" if total else "bytes */0", "Content-Type": mime}
+            range_header = f"bytes {offset}-{end - 1}/{total}" if total else "bytes */0"
             try:
-                status, hdrs, raw = http("PUT", location, data=chunk, headers=put_headers, timeout=600)
+                status, hdrs, raw = http("PUT", location, data=chunk,
+                                         headers={"Content-Range": range_header, "Content-Type": mime},
+                                         timeout=600)
             except HttpError as err:
                 if err.status in (429, 500, 502, 503, 504):
                     time.sleep(3)
                     continue
                 raise
             if status == 308:
-                rng = hdrs.get("Range")
-                offset = int(rng.split("-")[-1]) + 1 if rng else end
+                received = hdrs.get("Range")
+                offset = int(received.split("-")[-1]) + 1 if received else end
                 continue
             return json.loads(raw.decode())
 
@@ -286,18 +310,16 @@ class Drive:
         self.json_call("PATCH", f"{DRIVE}/files/{file_id}?fields=id", {"trashed": True})
 
 
-def md5_of(path):
-    digest = hashlib.md5()
-    with open(path, "rb") as fh:
-        for block in iter(lambda: fh.read(CHUNK), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def verify_upload(result, local_md5, name):
+    remote = result.get("md5Checksum")
+    if remote and remote != local_md5:
+        raise RuntimeError(f"upload verification failed for {name}")
 
 
-def remote_tree(drive, folder_id, prefix=""):
-    """Returns {relative path: file dict} for every non-folder under folder_id (recursive)."""
+def remote_tree(drive, folder_id):
+    """Returns {relative path: file} for every non-folder below folder_id."""
     result = {}
-    stack = [(folder_id, prefix)]
+    stack = [(folder_id, "")]
     while stack:
         current, base = stack.pop()
         for item in drive.list_children(current):
@@ -310,7 +332,7 @@ def remote_tree(drive, folder_id, prefix=""):
 
 
 class Server:
-    """Owns the Minecraft process, its console buffer and the player count."""
+    """Owns the Minecraft process, the console buffer and the player count."""
 
     def __init__(self):
         self.proc = None
@@ -322,20 +344,22 @@ class Server:
         self.done_event = threading.Event()
         self.last_error = None
         self.exit_code = None
-        self._cpu_last = None
         self.cpu_percent = None
         self.rss_mb = None
+        self._cpu_last = None
+        self.memory_mb = 0
 
     def start(self, command, memory_mb):
-        log("Starting Minecraft: " + " ".join(command[:6]) + " ...")
+        log("Starting Minecraft: " + " ".join(command[:5]) + " ...")
         self.state = "starting"
         self.saved_event.clear()
         self.done_event.clear()
         self.exit_code = None
-        self.proc = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="replace")
-        self.started_at = time.time()
         self.memory_mb = memory_mb
+        self.proc = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8",
+                                     errors="replace")
+        self.started_at = time.time()
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
@@ -361,33 +385,31 @@ class Server:
         return self.proc is not None and self.proc.poll() is None
 
     def send(self, text):
-        if self.alive():
-            try:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
-                return True
-            except (BrokenPipeError, OSError, ValueError):
-                return False
-        return False
-
-    def wait_for(self, event, timeout):
-        return event.wait(timeout)
+        if not self.alive():
+            return False
+        try:
+            self.proc.stdin.write(text + "\n")
+            self.proc.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
 
     def sample(self):
-        """CPU percent and RSS of the server process, read from /proc (Linux runners)."""
+        """CPU percent and RSS of the Minecraft process, read from /proc on Linux."""
         if not self.alive():
             self.cpu_percent, self.rss_mb = None, None
             return
         try:
             with open(f"/proc/{self.proc.pid}/stat") as fh:
-                parts = fh.read().split(")")[-1].split()
-            ticks = int(parts[11]) + int(parts[12])
-            clk = os.sysconf("SC_CLK_TCK")
+                fields = fh.read().split(")")[-1].split()
+            ticks = int(fields[11]) + int(fields[12])
+            clock = os.sysconf("SC_CLK_TCK")
             cpus = os.cpu_count() or 1
             now = time.time()
             if self._cpu_last:
-                prev_ticks, prev_time = self._cpu_last
-                self.cpu_percent = round(100.0 * (ticks - prev_ticks) / clk / max(now - prev_time, 0.001) / cpus, 1)
+                previous_ticks, previous_time = self._cpu_last
+                elapsed = max(now - previous_time, 0.001)
+                self.cpu_percent = round(100.0 * (ticks - previous_ticks) / clock / elapsed / cpus, 1)
             self._cpu_last = (ticks, now)
             with open(f"/proc/{self.proc.pid}/status") as fh:
                 for line in fh:
@@ -408,12 +430,12 @@ class Runner:
         self.ref = env("GITHUB_REF_NAME", "main")
         self.workflow = env("VOXEL_WORKFLOW_FILE", "voxelops-server.yml")
         self.limit_seconds = int(env("VOXEL_RUN_LIMIT_MINUTES", "330")) * 60
-        self.started = time.time()
         self.software = env("VOXEL_SOFTWARE", "vanilla")
         self.mc_version = env("VOXEL_MC_VERSION", "")
         self.loader = env("VOXEL_LOADER_VERSION", "")
         self.runtime = {"memoryMb": 3072, "syncIntervalMinutes": 10, "backupIntervalMinutes": 180,
                         "backupRetention": 7, "autoContinue": True}
+        self.started = time.time()
         self.stop_requested = False
         self.restart_requested = False
         self.kill_requested = False
@@ -431,13 +453,14 @@ class Runner:
         self.last_sync_check = time.time()
         self.last_backup_check = time.time()
 
-    # ----- control plane -----
+    # ----- Drive layout -----
     def ensure_folders(self):
-        self.control = self.drive.ensure_folder(self.folder, "control")
+        self.system = self.drive.ensure_folder(self.folder, SYSTEM_DIR)
+        self.control = self.drive.ensure_folder(self.system, "control")
         self.commands = self.drive.ensure_folder(self.control, "commands")
+        self.logs = self.drive.ensure_folder(self.system, "logs")
+        self.imports = self.drive.ensure_folder(self.system, "imports")
         self.backups = self.drive.ensure_folder(self.folder, "backups")
-        self.logs = self.drive.ensure_folder(self.folder, "logs")
-        self.imports = self.drive.ensure_folder(self.folder, "imports")
         self.server_cache = self.drive.ensure_folder(self.folder, "server")
 
     def refresh_runtime(self):
@@ -446,6 +469,7 @@ class Runner:
             self.runtime.update({k: v for k, v in data.items() if k in self.runtime})
         self.last_runtime = time.time()
 
+    # ----- status and console -----
     def write_status(self, final=False):
         alive = self.server.alive() and not final
         status = {
@@ -464,7 +488,7 @@ class Runner:
             "runId": self.run_id,
             "lastBackupAt": self.last_backup,
             "lastSyncAt": self.last_sync,
-            "runnerVersion": "1.0",
+            "runnerVersion": "1.1",
         }
         self.drive.write_bytes(self.control, "status.json", json.dumps(status), "application/json")
         self.last_status = time.time()
@@ -506,6 +530,7 @@ class Runner:
             self.kill_requested = True
             self.continue_after = False
         elif kind == "backup":
+            self.flush()
             self.make_backup("manual")
         elif kind == "sync":
             self.sync_up()
@@ -516,36 +541,13 @@ class Runner:
         else:
             log(f"Unknown command ignored: {kind}")
 
-    # ----- world sync (Drive is the source of truth) -----
+    # ----- save and upload -----
     def flush(self):
         if self.server.alive():
             self.server.saved_event.clear()
             self.server.send("save-all flush")
-            if not self.server.wait_for(self.server.saved_event, 90):
-                log("Timed out waiting for the world flush; syncing what is on disk.")
-
-    def sync_up(self):
-        self.sync_state = "syncing"
-        try:
-            self.flush()
-            for name in TOP_FILES:
-                local = os.path.join(ROOT, name)
-                if os.path.exists(local):
-                    self.push_file(self.folder, name, local, "text/plain" if name.endswith((".properties", ".txt")) else "application/octet-stream")
-            for folder in MIRROR_DIRS:
-                self.push_dir(folder)
-            self.last_sync = now_iso()
-            self.sync_state = "idle"
-            meta = self.drive.read_json(self.folder, "metadata.json") or {}
-            meta["lastSyncAt"] = self.last_sync
-            if self.last_backup:
-                meta["lastBackupAt"] = self.last_backup
-            self.drive.write_bytes(self.folder, "metadata.json", json.dumps(meta, indent=2), "application/json")
-            log("Sync complete.")
-        except (HttpError, OSError, urllib.error.URLError) as error:
-            self.sync_state = "error"
-            self.server.last_error = f"Sync failed: {error}"[:300]
-            log(self.server.last_error)
+            if not self.server.saved_event.wait(90):
+                log("Timed out waiting for the world flush; uploading what is on disk.")
 
     def push_file(self, parent, name, local, mime, remote=None):
         digest = md5_of(local)
@@ -553,16 +555,26 @@ class Runner:
             remote = self.drive.find(parent, name)
         if remote and remote.get("md5Checksum") == digest:
             return
-        self.drive.write_path(parent, name, local, mime, file_id=remote["id"] if remote else None)
+        last_error = None
+        for attempt in range(3):
+            try:
+                result = self.drive.write_path(parent, name, local, mime, file_id=remote["id"] if remote else None)
+                verify_upload(result, digest, name)
+                return
+            except (HttpError, OSError, RuntimeError, urllib.error.URLError) as error:
+                last_error = error
+                time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"could not upload {name}: {last_error}")
 
-    def push_dir(self, folder):
+    def push_dir(self, folder, replace=False):
+        """Uploads new and changed files. Remote-only files are removed only when replace is True."""
         local_root = os.path.join(ROOT, folder)
         remote_root = self.drive.ensure_folder(self.folder, folder)
         remote = remote_tree(self.drive, remote_root)
         local_files = {}
         if os.path.isdir(local_root):
-            for base, _, files in os.walk(local_root):
-                for name in files:
+            for base, _, names in os.walk(local_root):
+                for name in names:
                     full = os.path.join(base, name)
                     local_files[os.path.relpath(full, local_root).replace(os.sep, "/")] = full
         folder_ids = {"": remote_root}
@@ -574,9 +586,52 @@ class Runner:
                     folder_ids[key] = self.drive.ensure_folder(folder_ids["/".join(parts[:i])], parts[i])
             parent_id = folder_ids["/".join(parts[:-1])]
             self.push_file(parent_id, parts[-1], full, "application/octet-stream", remote=remote.get(rel))
-        for rel, meta in remote.items():
-            if rel not in local_files:
-                self.drive.trash(meta["id"])
+        if replace:
+            for rel, meta in remote.items():
+                if rel not in local_files:
+                    self.drive.trash(meta["id"])
+
+    def sync_up(self):
+        """Uploads every changed file. Never deletes Drive data. Failures keep local data and retry later."""
+        self.sync_state = "syncing"
+        try:
+            self.flush()
+            for name in TOP_FILES:
+                local = os.path.join(ROOT, name)
+                if os.path.exists(local):
+                    mime = "text/plain" if name.endswith((".properties", ".txt")) else "application/octet-stream"
+                    self.push_file(self.folder, name, local, mime)
+            for folder in SYNC_DIRS:
+                self.push_dir(folder)
+            self.last_sync = now_iso()
+            self.sync_state = "idle"
+            meta = self.drive.read_json(self.folder, "metadata.json") or {}
+            meta["lastSyncAt"] = self.last_sync
+            if self.last_backup:
+                meta["lastBackupAt"] = self.last_backup
+            self.drive.write_bytes(self.folder, "metadata.json", json.dumps(meta, indent=2), "application/json")
+            log("Sync complete.")
+        except (HttpError, OSError, RuntimeError, urllib.error.URLError, ValueError) as error:
+            self.sync_state = "error"
+            self.server.last_error = f"Sync failed, will retry: {error}"[:300]
+            log(self.server.last_error)
+
+    def pull_all(self):
+        """Startup only: restores every file from Drive. Downloads are atomic and md5 verified."""
+        for name in TOP_FILES:
+            found = self.drive.find(self.folder, name)
+            if found:
+                target = os.path.join(ROOT, name)
+                self.drive.download_to(found["id"], target)
+                if found.get("md5Checksum") and md5_of(target) != found["md5Checksum"]:
+                    raise RuntimeError(f"download verification failed for {name}")
+        eula = os.path.join(ROOT, "eula.txt")
+        content = open(eula).read() if os.path.exists(eula) else ""
+        if "eula=true" not in content:
+            with open(eula, "w") as fh:
+                fh.write("eula=true\n")
+        for folder in SYNC_DIRS:
+            self.pull_dir(folder)
 
     def pull_dir(self, folder):
         local_root = os.path.join(ROOT, folder)
@@ -589,28 +644,16 @@ class Runner:
                 continue
             log(f"Downloading {folder}/{rel}")
             self.drive.download_to(meta["id"], target)
-        for base, _, files in os.walk(local_root):
-            for name in files:
+            if meta.get("md5Checksum") and md5_of(target) != meta["md5Checksum"]:
+                raise RuntimeError(f"download verification failed for {folder}/{rel}")
+        for base, _, names in os.walk(local_root):
+            for name in names:
                 full = os.path.join(base, name)
                 if os.path.relpath(full, local_root).replace(os.sep, "/") not in remote:
                     os.remove(full)
 
-    def pull_all(self):
-        for name in TOP_FILES:
-            found = self.drive.find(self.folder, name)
-            if found:
-                self.drive.download_to(found["id"], os.path.join(ROOT, name))
-        eula = os.path.join(ROOT, "eula.txt")
-        content = open(eula).read() if os.path.exists(eula) else ""
-        if "eula=true" not in content:
-            with open(eula, "w") as fh:
-                fh.write("eula=true\n")
-        for folder in MIRROR_DIRS:
-            self.pull_dir(folder)
-
-    # ----- backups and restores -----
+    # ----- backups, restores and imports -----
     def make_backup(self, kind):
-        self.flush()
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         name = f"{kind}-{stamp}.zip"
         path = os.path.join(TMP, name)
@@ -619,18 +662,23 @@ class Runner:
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
                 for folder in WORLD_DIRS:
                     base = os.path.join(ROOT, folder)
-                    for root_dir, _, files in os.walk(base):
-                        for name_in in files:
+                    for root_dir, _, names in os.walk(base):
+                        for name_in in names:
                             full = os.path.join(root_dir, name_in)
                             archive.write(full, os.path.relpath(full, ROOT).replace(os.sep, "/"))
                 props = os.path.join(ROOT, "server.properties")
                 if os.path.exists(props):
                     archive.write(props, "server.properties")
-            self.drive.write_path(self.backups, name, path, "application/zip")
+            digest = md5_of(path)
+            result = self.drive.write_path(self.backups, name, path, "application/zip")
+            verify_upload(result, digest, name)
             self.last_backup = now_iso()
             if kind == "auto":
                 self.prune_backups()
-            log(f"Backup {name} uploaded.")
+            log(f"Backup {name} uploaded and verified.")
+        except (HttpError, OSError, RuntimeError, urllib.error.URLError, zipfile.BadZipFile) as error:
+            self.server.last_error = f"Backup failed: {error}"[:300]
+            log(self.server.last_error)
         finally:
             if os.path.exists(path):
                 os.remove(path)
@@ -638,35 +686,49 @@ class Runner:
 
     def prune_backups(self):
         keep = int(self.runtime.get("backupRetention", 7))
-        autos = sorted((f for f in self.drive.list_children(self.backups, folders=False) if f["name"].startswith("auto-")),
-                       key=lambda f: f["name"], reverse=True)
+        autos = sorted((f for f in self.drive.list_children(self.backups, folders=False)
+                        if f["name"].startswith("auto-")), key=lambda f: f["name"], reverse=True)
         for old in autos[keep:]:
             self.drive.trash(old["id"])
 
     def apply_archive(self, file_id):
-        """Replaces the local and Drive world folders with the archive. Server must be stopped."""
+        """Replaces the world with an archive. The previous world stays on disk until upload succeeds."""
         archive = os.path.join(TMP, "restore.zip")
         extract = os.path.join(TMP, "restore")
         shutil.rmtree(extract, ignore_errors=True)
         self.drive.download_to(file_id, archive)
+        stash = os.path.join(ROOT, ".voxel-previous")
         try:
             with zipfile.ZipFile(archive) as zf:
+                if zf.testzip() is not None:
+                    raise RuntimeError("The archive is damaged.")
                 zf.extractall(extract)
-            if not os.path.exists(os.path.join(extract, "world", "level.dat")) and os.path.exists(os.path.join(extract, "level.dat")):
-                os.makedirs(os.path.join(extract, "world"), exist_ok=True)
-                shutil.move(os.path.join(extract, "level.dat"), os.path.join(extract, "world", "level.dat"))
             if not os.path.exists(os.path.join(extract, "world", "level.dat")):
-                raise RuntimeError("The archive does not contain a Minecraft world (level.dat).")
+                if os.path.exists(os.path.join(extract, "level.dat")):
+                    os.makedirs(os.path.join(extract, "world"), exist_ok=True)
+                    shutil.move(os.path.join(extract, "level.dat"), os.path.join(extract, "world", "level.dat"))
+                else:
+                    raise RuntimeError("The archive does not contain a Minecraft world (level.dat).")
+            shutil.rmtree(stash, ignore_errors=True)
+            os.makedirs(stash)
             for folder in WORLD_DIRS:
-                shutil.rmtree(os.path.join(ROOT, folder), ignore_errors=True)
+                current = os.path.join(ROOT, folder)
+                if os.path.exists(current):
+                    os.replace(current, os.path.join(stash, folder))
                 source = os.path.join(extract, folder)
                 if os.path.isdir(source):
-                    shutil.move(source, os.path.join(ROOT, folder))
-            for folder in WORLD_DIRS:
-                remote_root = self.drive.ensure_folder(self.folder, folder)
-                for meta in remote_tree(self.drive, remote_root).values():
-                    self.drive.trash(meta["id"])
-            self.sync_up()
+                    os.replace(source, current)
+            try:
+                for folder in WORLD_DIRS:
+                    if os.path.isdir(os.path.join(ROOT, folder)):
+                        self.push_dir(folder, replace=True)
+            except (HttpError, OSError, RuntimeError, urllib.error.URLError) as error:
+                for folder in WORLD_DIRS:
+                    shutil.rmtree(os.path.join(ROOT, folder), ignore_errors=True)
+                    if os.path.exists(os.path.join(stash, folder)):
+                        os.replace(os.path.join(stash, folder), os.path.join(ROOT, folder))
+                raise RuntimeError(f"restore rolled back after upload failure: {error}") from None
+            shutil.rmtree(stash, ignore_errors=True)
         finally:
             shutil.rmtree(extract, ignore_errors=True)
             if os.path.exists(archive):
@@ -675,21 +737,23 @@ class Runner:
     def restore_from(self, file_id, importing=False):
         if not file_id:
             raise RuntimeError("Missing archive id")
-        self.stop_server("import" if importing else "restore")
+        self.graceful_stop("import" if importing else "restore")
         self.make_backup("prerestore")
         self.apply_archive(file_id)
-        self.restart_requested = True
+        self.restart_requested = False
         self.stop_requested = False
+        self.launch()
 
     def apply_pending_imports(self):
         for item in sorted(self.drive.list_children(self.imports, folders=False), key=lambda f: f["name"]):
             if item["name"].startswith("applied-"):
                 continue
             log(f"Applying imported world {item['name']}")
+            self.make_backup("prerestore")
             self.apply_archive(item["id"])
             self.drive.rename(item["id"], "applied-" + item["name"])
 
-    # ----- server lifecycle -----
+    # ----- Minecraft software -----
     def install_software(self):
         os.makedirs(ROOT, exist_ok=True)
         if self.software == "vanilla":
@@ -711,10 +775,12 @@ class Runner:
                 log("Running the loader installer. This takes a few minutes on the first start.")
                 subprocess.run(["java", "-jar", installer, "--installServer"], cwd=ROOT, check=True, timeout=1500)
         elif self.software == "paper":
-            info = json.loads(http("GET", f"https://fill.papermc.io/v3/projects/paper/versions/{self.mc_version}/builds/{self.loader}")[2].decode())
+            url = f"https://fill.papermc.io/v3/projects/paper/versions/{self.mc_version}/builds/{self.loader}"
+            info = json.loads(http("GET", url)[2].decode())
             self.download(info["downloads"]["server:default"]["url"], os.path.join(ROOT, "server.jar"))
         elif self.software == "purpur":
-            self.download(f"https://api.purpurmc.org/v2/purpur/{self.mc_version}/{self.loader}/download", os.path.join(ROOT, "server.jar"))
+            self.download(f"https://api.purpurmc.org/v2/purpur/{self.mc_version}/{self.loader}/download",
+                          os.path.join(ROOT, "server.jar"))
         elif self.software == "spigot":
             self.install_spigot()
         else:
@@ -729,14 +795,16 @@ class Runner:
         build_dir = os.path.join(TMP, "buildtools")
         os.makedirs(build_dir, exist_ok=True)
         tools = os.path.join(build_dir, "BuildTools.jar")
-        self.download("https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar", tools)
+        self.download("https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar",
+                      tools)
         log("Compiling Spigot with BuildTools. This takes several minutes the first time.")
         subprocess.run(["java", "-jar", tools, "--rev", self.mc_version], cwd=build_dir, check=True, timeout=3600)
         produced = glob.glob(os.path.join(build_dir, f"spigot-{self.mc_version}*.jar"))
         if not produced:
             raise RuntimeError("BuildTools did not produce a Spigot jar.")
         shutil.copy(produced[0], os.path.join(ROOT, "server.jar"))
-        self.drive.write_path(self.server_cache, cached_name, os.path.join(ROOT, "server.jar"), "application/java-archive")
+        self.drive.write_path(self.server_cache, cached_name, os.path.join(ROOT, "server.jar"),
+                              "application/java-archive")
 
     def download(self, url, target):
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -766,13 +834,13 @@ class Runner:
         self.server.start(self.build_command(memory), memory)
         self.write_status()
 
-    def stop_server(self, reason="stop"):
+    # ----- shutdown sequences -----
+    def stop_server(self, reason):
         if not self.server.alive():
             self.server.state = "offline"
             return
         log(f"Stopping the server ({reason}).")
         self.server.send("say VoxelOps: saving the world and stopping shortly.")
-        self.flush()
         self.server.state = "stopping"
         self.server.send("stop")
         try:
@@ -785,6 +853,15 @@ class Runner:
             except subprocess.TimeoutExpired:
                 self.server.proc.kill()
         self.server.state = "offline"
+
+    def graceful_stop(self, reason):
+        """Save -> upload -> backup -> stop -> upload again. Used for stop, restart, restore and time limit."""
+        if self.server.alive():
+            self.flush()
+            self.sync_up()
+            self.make_backup("auto")
+            self.stop_server(reason)
+        self.sync_up()
 
     def kill_server(self):
         if self.server.alive():
@@ -799,6 +876,7 @@ class Runner:
         self.install_software()
         self.refresh_runtime()
         self.sync_state = "restoring"
+        self.write_status()
         self.pull_all()
         self.apply_pending_imports()
         self.sync_state = "idle"
@@ -816,24 +894,20 @@ class Runner:
                 self.continue_after = bool(self.runtime.get("autoContinue", True))
                 self.stop_requested = True
             if self.stop_requested:
-                self.stop_server("stop")
-                self.sync_up()
+                self.graceful_stop("stop")
                 break
             if self.restart_requested:
                 self.restart_requested = False
                 log("Restart requested.")
-                self.stop_server("restart")
-                self.sync_up()
-                self.pull_all()
+                self.graceful_stop("restart")
                 self.launch()
-            if self.server.proc is not None and not self.server.alive():
+            if self.server.proc is not None and not self.server.alive() and not self.stop_requested:
                 code = self.server.exit_code
                 log(f"The server exited with code {code}.")
                 self.sync_up()
                 if code not in (0, None) and self.restarts < 3:
                     self.restarts += 1
                     time.sleep(20)
-                    self.pull_all()
                     self.launch()
                 else:
                     break
@@ -877,7 +951,7 @@ class Runner:
 
     def finish(self):
         if self.server.alive():
-            self.stop_server("shutdown")
+            self.graceful_stop("shutdown")
         self.sync_state = "idle"
         self.server.state = "offline"
         try:
@@ -888,7 +962,7 @@ class Runner:
                 with LOG_LOCK:
                     fh.write("\n".join(LOG_LINES) + "\n")
             self.drive.write_path(self.logs, f"run-{self.run_id}.log", archive, "text/plain")
-        except (HttpError, OSError, urllib.error.URLError) as error:
+        except (HttpError, OSError, urllib.error.URLError, RuntimeError) as error:
             log(f"Could not write the final status: {error}")
         if self.continue_after and not self.kill_requested:
             self.dispatch_next()
@@ -925,7 +999,7 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
     try:
         runner.run()
-    except Exception as error:  # every fatal error is reported in the status file and the console
+    except Exception as error:  # every fatal error is written to status and to the console
         log(f"Fatal error: {error}")
         runner.server.last_error = f"Fatal: {error}"[:300]
         try:
