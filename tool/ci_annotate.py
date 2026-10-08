@@ -41,12 +41,11 @@ def main() -> int:
             if emitted >= MAX:
                 break
         if emitted == 0:
-            for line in lines:
-                if re.search(r"\b(error|warning|info)\b.*\.dart", line) or re.search(r"issues? found", line):
-                    emit("error", line.strip())
-                    emitted += 1
-                    if emitted >= MAX:
-                        break
+            # Fallback: the tail of the analyzer output explains failures that are not lint findings.
+            tail = [line.strip() for line in lines if line.strip()][-25:]
+            for line in tail:
+                emit("error", line)
+                emitted += 1
     elif mode == "test":
         for line in lines:
             if "[E]" in line or line.strip().startswith(("Expected:", "Actual:", "Which:")):
