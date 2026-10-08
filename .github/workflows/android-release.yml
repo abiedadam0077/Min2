@@ -159,14 +159,21 @@ jobs:
           TAG: v${{ needs.build.outputs.version }}-build.${{ github.run_number }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          set -euo pipefail
-          NOTES="VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER}) built from commit ${GITHUB_SHA} on branch ${GITHUB_REF_NAME}.
-
-          Install: download VoxelOps.apk and open it on an Android phone (Android 7.0 or newer).
-          Verify: compare the SHA-256 in SHA256SUMS.txt."
-          if gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER})" --notes "$NOTES" --latest; then
+          set -uo pipefail
+          ls -la dist
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          printf '%s\n' \
+            "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER}) built from commit ${GITHUB_SHA} on branch ${GITHUB_REF_NAME}." \
+            "" \
+            "Install: download VoxelOps.apk and open it on an Android phone (Android 7.0 or newer)." \
+            "Verify: compare the SHA-256 values in SHA256SUMS.txt." > "$NOTES_FILE"
+          if OUTPUT=$(gh release create "$TAG" dist/VoxelOps.apk dist/SHA256SUMS.txt dist/VoxelOps-*.apk \
+                --target "$GITHUB_SHA" --title "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER})" \
+                --notes-file "$NOTES_FILE" --latest 2>&1); then
             echo "Published release ${TAG}."
+            echo "$OUTPUT"
           else
-            echo "Release creation failed; uploading assets to the existing tag." >&2
-            gh release upload "$TAG" dist/* --clobber
+            echo "::error title=release-create::$(echo "$OUTPUT" | tr '\n' ' ' | cut -c1-500)"
+            echo "$OUTPUT" >&2
+            exit 1
           fi
