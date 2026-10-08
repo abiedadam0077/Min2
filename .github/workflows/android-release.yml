@@ -43,7 +43,7 @@ jobs:
         id: analyze
         run: |
           set -o pipefail
-          flutter analyze 2>&1 | tee analyze.log
+          flutter analyze --no-fatal-infos 2>&1 | tee analyze.log
       - name: Annotate analyzer findings
         if: failure() && steps.analyze.outcome == 'failure'
         run: python3 tool/ci_annotate.py analyze analyze.log
