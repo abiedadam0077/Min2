@@ -195,13 +195,24 @@ jobs:
             "Install: download VoxelOps.apk and open it on an Android phone (Android 7.0 or newer)." \
             "Verify: compare the SHA-256 values in SHA256SUMS.txt." > "$NOTES_FILE"
           if [ -f dist/SIGNING-CERT-SHA1.txt ]; then cat dist/SIGNING-CERT-SHA1.txt >> "$NOTES_FILE"; fi
-          if OUTPUT=$(gh release create "$TAG" dist/VoxelOps.apk dist/SHA256SUMS.txt dist/VoxelOps-*.apk \
-                --target "$GITHUB_SHA" --title "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER})" \
-                --notes-file "$NOTES_FILE" --latest 2>&1); then
-            echo "Published release ${TAG}."
-            echo "$OUTPUT"
-          else
-            echo "::error title=release-create::$(echo "$OUTPUT" | tr '\n' ' ' | cut -c1-500)"
-            echo "$OUTPUT" >&2
-            exit 1
-          fi
+          # GitHub occasionally answers release creation with HTTP 5xx. Retry, and reuse a release that a
+          # partially successful attempt already created.
+          for attempt in 1 2 3; do
+            if OUTPUT=$(gh release create "$TAG" dist/VoxelOps.apk dist/SHA256SUMS.txt dist/VoxelOps-*.apk \
+                  --target "$GITHUB_SHA" --title "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER})" \
+                  --notes-file "$NOTES_FILE" --latest 2>&1); then
+              echo "Published release ${TAG} (attempt ${attempt})."
+              echo "$OUTPUT"
+              exit 0
+            fi
+            echo "Release creation attempt ${attempt} failed: $(echo "$OUTPUT" | tr '\n' ' ' | cut -c1-300)"
+            if gh release view "$TAG" > /dev/null 2>&1; then
+              gh release upload "$TAG" dist/VoxelOps.apk dist/SHA256SUMS.txt dist/VoxelOps-*.apk --clobber
+              gh release edit "$TAG" --latest
+              echo "Release ${TAG} exists; assets were uploaded to it."
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          echo "::error title=release-create::Could not create release ${TAG} after 3 attempts."
+          exit 1
