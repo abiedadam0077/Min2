@@ -30,7 +30,7 @@ def main() -> int:
         lines = fh.read().splitlines()
     emitted = 0
     if mode == "analyze":
-        pattern = re.compile(r"^\s*(error|warning|info)\s+•\s+(.*?)\s+•\s+(\S+?):(\d+):(\d+)\s+•\s+(\S+)")
+        pattern = re.compile(r"^\s*(error|warning|info)\s+[•\-|]\s+(.*?)\s+[•\-|]\s+(\S+?):(\d+):(\d+)\s+[•\-|]\s+(\S+)")
         for line in lines:
             match = pattern.match(line)
             if not match:
@@ -40,6 +40,13 @@ def main() -> int:
             emitted += 1
             if emitted >= MAX:
                 break
+        if emitted == 0:
+            for line in lines:
+                if re.search(r"\b(error|warning|info)\b.*\.dart", line) or re.search(r"issues? found", line):
+                    emit("error", line.strip())
+                    emitted += 1
+                    if emitted >= MAX:
+                        break
     elif mode == "test":
         for line in lines:
             if "[E]" in line or line.strip().startswith(("Expected:", "Actual:", "Which:")):
