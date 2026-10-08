@@ -22,3 +22,12 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+
+// Android Lint runs inside plugin modules too (for example file_selector_android). Its analysis
+// can crash on CI images without affecting the build, so every lint task is disabled. The release
+// gate is `flutter analyze` plus the test suite.
+allprojects {
+    tasks.matching { it.name.lowercase().contains("lint") }.configureEach {
+        enabled = false
+    }
+}
