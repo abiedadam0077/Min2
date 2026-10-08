@@ -27,3 +27,7 @@ android/.cxx/
 *.pem
 *.p12
 secrets/
+
+# Python bytecode produced by local checks
+__pycache__/
+*.pyc
