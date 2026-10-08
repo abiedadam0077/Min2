@@ -15,7 +15,6 @@ Scenario
 7. Queue "stop" -> clean exit.
 """
 
-import hashlib
 import io
 import json
 import os
@@ -36,6 +35,9 @@ REPO = HERE.parents[1]
 RUNNER = REPO / "assets" / "runtime" / "voxelops_runner.py"
 WORK = Path(os.environ.get("RUNNER_TEMP") or "/tmp") / "voxelops-e2e"
 RESULTS = {}
+# A marker file inside the world. Minecraft rewrites level.dat on every start, so byte-for-byte comparison
+# of level.dat is not a valid check on a live server; the marker proves which world content was restored.
+MARKER = "voxelops-marker.txt"
 
 
 def notice(message):
@@ -173,6 +175,7 @@ def main():
     wait_for(lambda: "voxelops-e2e" in harness.live_log(), 240, "console output")
     wait_for(lambda: "players online" in harness.live_log(), 240, "player list from the server")
     RESULTS["console_and_players"] = True
+    (WORK / "minecraft" / "world" / MARKER).write_text("marker-A", encoding="utf-8")
 
     # 3. Manual backup must be uploaded and contain the world.
     harness.queue("backup")
@@ -181,6 +184,8 @@ def main():
     names = archive.namelist()
     if "world/level.dat" not in names:
         fail(f"manual backup has no world/level.dat: {names[:5]}")
+    if f"world/{MARKER}" not in names or archive.read(f"world/{MARKER}").decode() != "marker-A":
+        fail("manual backup does not contain the marker that was written before the backup")
     RESULTS["manual_backup_entries"] = len(names)
     notice(f"manual backup uploaded with {len(names)} entries")
 
@@ -208,7 +213,12 @@ def main():
     proc = start_runner(env, log_two)
     wait_for(lambda: (WORK / "minecraft" / "world" / "level.dat").exists(), 300, "world downloaded from Drive")
     wait_for(lambda: harness.status().get("state") == "running", 900, "server running (second run)")
+    pulled_marker = WORK / "minecraft" / "world" / MARKER
+    if not pulled_marker.exists() or pulled_marker.read_text(encoding="utf-8") != "marker-A":
+        fail("the second run did not pull the marker from Drive")
     RESULTS["world_pulled_from_drive"] = True
+    # Make the local world differ from the backup so the restore has something to prove.
+    pulled_marker.write_text("marker-B", encoding="utf-8")
     notice("second run pulled the world from Drive and reached running state")
 
     # 6. Restore the manual backup.
@@ -216,10 +226,12 @@ def main():
     wait_for(lambda: harness.backup("prerestore-"), 600, "pre-restore backup")
     wait_for(lambda: count_in(log_two, "Starting Minecraft:") >= 2, 600, "server restarted after restore")
     wait_for(lambda: harness.status().get("state") == "running", 900, "server running after restore")
-    local_level = (WORK / "minecraft" / "world" / "level.dat").read_bytes()
-    backup_level = archive.read("world/level.dat")
-    if hashlib.sha256(local_level).digest() != hashlib.sha256(backup_level).digest():
-        fail("restored world/level.dat does not match the backup")
+    restored = (WORK / "minecraft" / "world" / MARKER)
+    restored_text = restored.read_text(encoding="utf-8") if restored.exists() else ""
+    if restored_text != "marker-A":
+        fail(f"restored world does not match the backup (marker is {restored_text!r}, expected 'marker-A')")
+    if not (WORK / "minecraft" / "world" / "level.dat").exists():
+        fail("restored world has no level.dat")
     RESULTS["restore_matches_backup"] = True
     notice("restore created a pre-restore backup and the server runs the restored world")
 

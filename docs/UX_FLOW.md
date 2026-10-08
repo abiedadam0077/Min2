@@ -21,7 +21,7 @@ Pushed screens: Welcome, Connect, Accounts, Repository picker, Create wizard, Cr
 2. **Version**: live list from the official source; Release or Snapshot filter; search. Choosing a version does not resolve the build yet.
 3. **Details**: name (3 to 40 characters), description, optional icon (converted to 64 by 64 PNG).
 4. **Settings**: MOTD, max players, game mode, difficulty, online mode (with warning), PvP, whitelist, Nether, seed; runner memory, backup interval, retention and auto-continue.
-5. **Repository and consent**: choose an existing repository (with push access) or create a new one (private by default). Runner label. EULA acceptance (required). GitHub Actions terms acknowledgement (required). Optional "start after creation".
+5. **Repository and consent**: choose an existing repository (with push access) or create a new one (private by default). GitHub-hosted runner (fixed: ubuntu-latest). EULA acceptance (required). GitHub Actions terms acknowledgement (required). Optional "start after creation".
 6. **Review**: shows the resolved loader build and Java major version. "Create server" starts the job.
 7. **Progress**: six steps with live status (resolve, Drive folders, repository, workflow and runner, encrypted secrets, first dispatch). Failure shows the exact reason with Retry or Edit settings. Success opens the dashboard.
 

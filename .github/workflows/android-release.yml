@@ -49,9 +49,11 @@ jobs:
         run: python3 tool/ci_annotate.py analyze analyze.log
       - name: Runner compiles (Python 3 standard library)
         run: |
-          python3 -m py_compile assets/runtime/voxelops_runner.py
+          python3 -m py_compile assets/runtime/voxelops_runner.py tests/e2e/run_e2e.py tests/e2e/fake_drive.py tests/e2e/test_drive_layer.py
           python3 -m pyflakes --version >/dev/null 2>&1 || python3 -m pip install --quiet pyflakes
-          python3 -m pyflakes assets/runtime/voxelops_runner.py tool/ci_annotate.py tool/generate_icons.py
+          python3 -m pyflakes assets/runtime/voxelops_runner.py tool/ci_annotate.py tool/generate_icons.py tests/e2e/run_e2e.py tests/e2e/fake_drive.py tests/e2e/test_drive_layer.py
+      - name: Runner Google Drive layer (fake Drive server, stdlib only)
+        run: python3 tests/e2e/test_drive_layer.py
       - name: Unit and widget tests
         id: test
         if: always()
@@ -89,10 +91,12 @@ jobs:
           VERSION="$(sed -n 's/^version: *\([0-9][0-9.]*\).*/\1/p' pubspec.yaml | head -n 1)"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
-          if [ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" ]; then
-            PREFIX="${GOOGLE_OAUTH_CLIENT_ID%.apps.googleusercontent.com}"
-            echo "GOOGLE_REDIRECT_SCHEME=com.googleusercontent.apps.${PREFIX,,}" >> "$GITHUB_ENV"
-          fi
+          # The redirect scheme is derived from GOOGLE_OAUTH_CLIENT_ID by build.gradle.kts and by the app,
+          # so only the client ID itself is needed here. Warn early when it is missing or malformed.
+          case "${GOOGLE_OAUTH_CLIENT_ID:-}" in
+            *.apps.googleusercontent.com) echo "Google OAuth client ID is configured." ;;
+            *) echo "::warning title=Google Drive::Repository variable GOOGLE_OAUTH_CLIENT_ID is missing or is not an Android OAuth client ID (<id>.apps.googleusercontent.com). Google Drive sign-in will be disabled in this build." ;;
+          esac
 
       - name: Prepare release signing key
         env:

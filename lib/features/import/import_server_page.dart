@@ -6,6 +6,7 @@ import '../../core/i18n/i18n.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_tokens.dart';
 import '../../core/widgets/common.dart';
+import '../../core/widgets/feedback.dart';
 import '../../core/widgets/shell.dart';
 import '../../data/provisioning/server_provisioner.dart';
 import '../../state/core_providers.dart';
@@ -80,9 +81,11 @@ class ImportServerPage extends ConsumerWidget {
     );
   }
 
+  /// Recovery flow: choose a repository (or create one), recreate the workflow and secrets,
+  /// then offer to start the server straight away.
   Future<void> _attach(BuildContext context, WidgetRef ref, DiscoveredServer server) async {
     final selection = await context.push<RepoSelection>('/repos?mode=attach');
-    if (selection == null || selection.create || !context.mounted) {
+    if (selection == null || !context.mounted) {
       return;
     }
     final ok = await guardedAction(context, ref, () async {
@@ -90,11 +93,34 @@ class ImportServerPage extends ConsumerWidget {
             driveFolderId: server.folderId,
             repoOwner: selection.owner,
             repoName: selection.name,
+            createRepository: selection.create,
+            repoPrivate: selection.isPrivate,
           );
       ref.read(serverRegistryProvider.notifier).reload();
       await ref.read(activeServerIdProvider.notifier).select(record.id);
     }, successKey: 'import.done');
-    if (ok && context.mounted) {
+    if (!ok || !context.mounted) {
+      return;
+    }
+    final activeId = ref.read(activeServerIdProvider);
+    final attached = findServer(ref.read(serverRegistryProvider), activeId ?? '');
+    if (attached != null) {
+      final start = await confirmAction(
+        context,
+        title: context.tr('import.startTitle'),
+        message: context.tr('import.startBody'),
+        confirmLabel: context.tr('action.start'),
+      );
+      if (start && context.mounted) {
+        await guardedAction(
+          context,
+          ref,
+          () => ref.read(serverActionsProvider).startServer(attached),
+          successKey: 'dashboard.startQueued',
+        );
+      }
+    }
+    if (context.mounted) {
       context.go('/home');
     }
   }

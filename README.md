@@ -3,7 +3,7 @@
 Native Flutter Android app to create and run Minecraft servers from your phone.
 
 - **Runs on your accounts.** GitHub Actions runs the server, Google Drive stores the world, configs, mods, backups and recovery metadata, and Tailscale gives you a private address.
-- **Recoverable.** Every server is a Drive folder (`MinecraftServers/<Name>/`). Import it on any phone and reattach it to a repository.
+- **Recoverable.** Every server is a Drive folder (`Minecraft Servers/<Name>/`). Import it on any phone and reattach it to a repository.
 - **Native UI.** Flutter widgets only. Arabic and English with full right-to-left layout.
 - **Secure by design.** Tokens live in Android Keystore-backed storage. No client secret is compiled into the APK. Repository secrets are encrypted with the repository public key.
 

@@ -14,8 +14,27 @@ class GoogleAccount {
   final String? pictureUrl;
 }
 
-/// Google sign-in through the system browser (AppAuth, PKCE, no client secret).
-/// Only the drive.file scope is requested: the app sees only files it creates.
+/// Maps OAuth error codes to outcomes the user can act on. Kept pure so it can be unit tested.
+AppException classifyGoogleAuthError(String? oauthError) {
+  switch (oauthError) {
+    case 'access_denied':
+      return const AppException(AppErrorKind.forbidden, 'Google denied the requested permissions.');
+    case 'invalid_grant':
+      return const AppException(AppErrorKind.sessionExpired, 'The Google grant is no longer valid.');
+    case 'invalid_client':
+    case 'unauthorized_client':
+    case 'redirect_uri_mismatch':
+    case 'invalid_request':
+      return const AppException(AppErrorKind.notConfigured, 'The Google OAuth client is not configured for this build.');
+    default:
+      return const AppException(AppErrorKind.signInFailed, 'Google sign-in did not complete.');
+  }
+}
+
+/// Google sign-in through the system browser (AppAuth with PKCE, no client secret).
+///
+/// Scopes: openid, email, profile and drive.file. drive.file only grants access to files and folders
+/// that this app creates, which is exactly what the server storage needs.
 class GoogleAuthService {
   GoogleAuthService({required SecureStore secureStore, required ApiClient api, FlutterAppAuth? appAuth})
       : _store = secureStore,
@@ -27,6 +46,11 @@ class GoogleAuthService {
   static const String _userInfoEndpoint = 'https://openidconnect.googleapis.com/v1/userinfo';
   static const String _revokeEndpoint = 'https://oauth2.googleapis.com/revoke';
 
+  static const AuthorizationServiceConfiguration _configuration = AuthorizationServiceConfiguration(
+    authorizationEndpoint: _authorizationEndpoint,
+    tokenEndpoint: _tokenEndpoint,
+  );
+
   final SecureStore _store;
   final ApiClient _api;
   final FlutterAppAuth _appAuth;
@@ -34,13 +58,9 @@ class GoogleAuthService {
   String? _accessToken;
   DateTime? _accessTokenExpiry;
 
-  static const AuthorizationServiceConfiguration _configuration = AuthorizationServiceConfiguration(
-    authorizationEndpoint: _authorizationEndpoint,
-    tokenEndpoint: _tokenEndpoint,
-  );
-
   Future<bool> hasRefreshToken() async => (await _store.read(SecureKeys.googleRefreshToken))?.isNotEmpty ?? false;
 
+  /// Opens the Google consent screen and stores the refresh token in secure storage.
   Future<GoogleAccount> signIn() async {
     _requireConfigured();
     final AuthorizationTokenResponse response;
@@ -51,39 +71,40 @@ class GoogleAuthService {
           AppConfig.googleRedirectUri,
           serviceConfiguration: _configuration,
           scopes: AppConfig.googleScopes.split(' '),
+          // "consent" makes Google return a refresh token even if the user approved before.
           promptValues: const <String>['consent'],
           additionalParameters: const <String, String>{'access_type': 'offline'},
         ),
       );
     } on FlutterAppAuthUserCancelledException {
       throw const AppException(AppErrorKind.cancelled, 'Google sign-in was cancelled.');
-    } on PlatformException catch (error) {
-      throw AppException(AppErrorKind.unauthorized, 'Google sign-in failed. ${error.message ?? ''}'.trim());
+    } on FlutterAppAuthPlatformException catch (error) {
+      throw classifyGoogleAuthError(error.platformErrorDetails.error);
+    } on PlatformException {
+      throw const AppException(AppErrorKind.signInFailed, 'Google sign-in did not complete.');
     }
     final refreshToken = response.refreshToken;
     final accessToken = response.accessToken;
     if (refreshToken == null || refreshToken.isEmpty || accessToken == null || accessToken.isEmpty) {
-      throw const AppException(
-        AppErrorKind.unauthorized,
-        'Google did not return offline access. Remove the app from your Google account permissions and try again.',
-      );
+      throw const AppException(AppErrorKind.signInFailed, 'Google did not grant offline access.');
     }
     await _store.write(SecureKeys.googleRefreshToken, refreshToken);
     _accessToken = accessToken;
-    _accessTokenExpiry = response.accessTokenExpirationDateTime;
+    _accessTokenExpiry = response.accessTokenExpirationDateTime ?? DateTime.now().add(const Duration(minutes: 50));
     return _fetchAccount(accessToken);
   }
 
-  /// Returns a valid access token, refreshing it with the stored refresh token when needed.
-  Future<String> accessToken() async {
+  /// Returns a valid access token. Refreshes with the stored refresh token when it is near expiry
+  /// or when [forceRefresh] is true (after the Drive API answered 401).
+  Future<String> accessToken({bool forceRefresh = false}) async {
     final cached = _accessToken;
     final expiry = _accessTokenExpiry;
-    if (cached != null && expiry != null && expiry.isAfter(DateTime.now().add(const Duration(minutes: 1)))) {
+    if (!forceRefresh && cached != null && expiry != null && expiry.isAfter(DateTime.now().add(const Duration(minutes: 2)))) {
       return cached;
     }
     final refreshToken = await _store.read(SecureKeys.googleRefreshToken);
     if (refreshToken == null || refreshToken.isEmpty) {
-      throw const AppException(AppErrorKind.unauthorized, 'Google Drive is not connected.');
+      throw const AppException(AppErrorKind.sessionExpired, 'Google Drive is not connected.');
     }
     _requireConfigured();
     try {
@@ -94,12 +115,11 @@ class GoogleAuthService {
           refreshToken: refreshToken,
           grantType: GrantType.refreshToken,
           serviceConfiguration: _configuration,
-          scopes: AppConfig.googleScopes.split(' '),
         ),
       );
       final token = response.accessToken;
       if (token == null || token.isEmpty) {
-        throw const AppException(AppErrorKind.unauthorized, 'Google Drive session expired. Reconnect Google Drive.');
+        throw const AppException(AppErrorKind.sessionExpired, 'Google did not return an access token.');
       }
       final rotated = response.refreshToken;
       if (rotated != null && rotated.isNotEmpty && rotated != refreshToken) {
@@ -109,10 +129,16 @@ class GoogleAuthService {
       _accessTokenExpiry = response.accessTokenExpirationDateTime ?? DateTime.now().add(const Duration(minutes: 50));
       return token;
     } on FlutterAppAuthPlatformException catch (error) {
-      throw AppException(
-        AppErrorKind.unauthorized,
-        'Google Drive session expired. Reconnect Google Drive. (${error.message ?? 'auth error'})',
-      );
+      final mapped = classifyGoogleAuthError(error.platformErrorDetails.error);
+      if (mapped.kind == AppErrorKind.sessionExpired) {
+        // The grant was revoked or expired: forget it so the UI asks the user to connect again.
+        await _store.delete(SecureKeys.googleRefreshToken);
+        _accessToken = null;
+        _accessTokenExpiry = null;
+      }
+      throw mapped;
+    } on PlatformException {
+      throw const AppException(AppErrorKind.network, 'Could not refresh the Google session.');
     }
   }
 
@@ -131,7 +157,7 @@ class GoogleAuthService {
     );
   }
 
-  /// Revokes the grant when possible and forgets every local credential.
+  /// Revokes the grant when possible and removes every local credential.
   Future<void> signOut() async {
     final refreshToken = await _store.read(SecureKeys.googleRefreshToken);
     if (refreshToken != null && refreshToken.isNotEmpty) {
@@ -157,5 +183,4 @@ class GoogleAuthService {
       throw const AppException(AppErrorKind.notConfigured, 'Google OAuth client ID is not configured for this build.');
     }
   }
-
 }

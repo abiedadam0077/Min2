@@ -37,7 +37,10 @@ class ServerActions {
     return folder.id;
   }
 
-  Future<String> controlFolder(ServerRecord record) => _folder(record.driveFolderId, DriveLayout.control);
+  /// <server>/_voxelops : system folder (control queue, status, logs, imports).
+  Future<String> systemFolder(ServerRecord record) => _folder(record.driveFolderId, DriveLayout.system);
+
+  Future<String> controlFolder(ServerRecord record) async => _folder(await systemFolder(record), DriveLayout.control);
 
   Future<String?> _cachedFileId(String parentId, String name) async {
     final key = 'file:$parentId/$name';
@@ -202,7 +205,7 @@ class ServerActions {
 
   /// Uploads a world archive to imports/ and asks the runner to apply it.
   Future<void> importWorld(ServerRecord record, {required String fileName, required List<int> bytes}) async {
-    final folder = await _folder(record.driveFolderId, DriveLayout.imports);
+    final folder = await _folder(await systemFolder(record), DriveLayout.imports);
     final safeName = fileName.replaceAll(RegExp(r'[^A-Za-z0-9._ -]'), '_');
     final stored = await drive.createFile(
       parentId: folder,

@@ -112,17 +112,40 @@ class GoogleAccountNotifier extends AsyncNotifier<GoogleAccount?> {
     );
   }
 
+  /// Runs the Google sign-in flow. Any failure except a user cancellation is reported as a single
+  /// friendly "could not connect Google Drive" error; the technical reason stays out of the UI.
   Future<void> connect() async {
     state = AsyncLoading<GoogleAccount?>();
     state = await AsyncValue.guard(() async {
-      final account = await ref.read(googleAuthProvider).signIn();
-      await ref.read(prefsProvider).setGoogleAccount({
-        'email': account.email,
-        'name': account.name,
-        'picture': account.pictureUrl,
-      });
-      return account;
+      try {
+        final account = await ref.read(googleAuthProvider).signIn();
+        await ref.read(prefsProvider).setGoogleAccount({
+          'email': account.email,
+          'name': account.name,
+          'picture': account.pictureUrl,
+        });
+        return account;
+      } on AppException catch (error) {
+        if (error.kind == AppErrorKind.cancelled) {
+          rethrow;
+        }
+        throw AppException(AppErrorKind.signInFailed, error.message, statusCode: error.statusCode);
+      }
     });
+  }
+
+  /// Confirms that the stored grant still works by refreshing the access token.
+  /// A revoked or expired grant clears the local connection so the card asks the user to connect again.
+  Future<void> verify() async {
+    try {
+      await ref.read(googleAuthProvider).accessToken(forceRefresh: true);
+    } on AppException catch (error) {
+      if (error.kind == AppErrorKind.sessionExpired) {
+        await ref.read(prefsProvider).setGoogleAccount(null);
+        state = const AsyncData<GoogleAccount?>(null);
+      }
+      rethrow;
+    }
   }
 
   Future<void> disconnect() async {

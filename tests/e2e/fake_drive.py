@@ -28,6 +28,10 @@ class FakeDrive:
         self.lock = threading.RLock()
         self.files = {}
         self.sessions = {}
+        # Fault injection for tests (all off by default).
+        self.fail_put_after_store = False  # next chunk is stored, then answered with 503 (lost response)
+        self.expire_token_once = False     # next authenticated call answers 401 once
+        self.revoked = False               # token endpoint answers invalid_grant
         self.add_entry("root", "root", FOLDER, [], b"")
 
     def add_entry(self, file_id, name, mime, parents, content):
@@ -162,12 +166,17 @@ def make_handler(drive):
             return self.rfile.read(length) if length else b""
 
         def _auth_ok(self):
+            if drive.expire_token_once:
+                drive.expire_token_once = False
+                return False
             return self.headers.get("Authorization", "").startswith("Bearer ")
 
         def do_POST(self):
             url = urlparse(self.path)
             body = self._body()
             if url.path == "/token":
+                if drive.revoked:
+                    return self._json(400, {"error": "invalid_grant", "error_description": "Token has been expired or revoked."})
                 return self._json(200, {"access_token": "e2e-access-token", "expires_in": 3600, "token_type": "Bearer"})
             if not self._auth_ok():
                 return self._json(401, {"error": {"message": "missing bearer token"}})
@@ -216,18 +225,26 @@ def make_handler(drive):
             session_id = url.path.rsplit("/", 1)[1]
             with drive.lock:
                 session = drive.sessions[session_id]
-                if self.headers.get("Content-Range", "") == "bytes */0":
+                content_range = self.headers.get("Content-Range", "")
+                if content_range == "bytes */0":
                     session["buf"] = b""
                     total = 0
+                elif content_range.startswith("bytes */"):
+                    # Status query (no data): report how many bytes Drive already stored.
+                    total = int(content_range.split("/")[-1])
                 else:
-                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", self.headers.get("Content-Range", ""))
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
                     start, _, total = int(match.group(1)), int(match.group(2)), int(match.group(3))
                     if start != len(session["buf"]):
                         return self._json(400, {"error": {"message": "out of order chunk"}})
                     session["buf"] += body
-                if len(session["buf"]) < total:
-                    received = len(session["buf"])
-                    return self._send(308, b"", {"Range": f"bytes=0-{received - 1}"})
+                    if drive.fail_put_after_store:
+                        drive.fail_put_after_store = False
+                        return self._json(503, {"error": {"message": "transient failure"}})
+                received = len(session["buf"])
+                if received < total:
+                    headers = {"Range": f"bytes=0-{received - 1}"} if received else {}
+                    return self._send(308, b"", headers)
                 content = session["buf"]
                 if session["file_id"]:
                     meta = drive.store_content(session["file_id"], content)

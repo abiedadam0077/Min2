@@ -6,11 +6,12 @@ import '../../core/i18n/i18n.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_tokens.dart';
 import '../../core/widgets/common.dart';
-import '../../core/widgets/feedback.dart';
 import '../../state/auth_providers.dart';
+import '../../state/drive_storage_providers.dart';
+import '../drive/drive_card.dart';
 import 'connect_sheets.dart';
 
-/// Connection hub: GitHub and Google Drive are required; Tailscale is optional.
+/// Connect Services: GitHub and Google Drive are required, Tailscale is optional.
 class ConnectPage extends ConsumerWidget {
   const ConnectPage({super.key});
 
@@ -18,8 +19,9 @@ class ConnectPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final github = ref.watch(githubAccountsProvider);
     final google = ref.watch(googleAccountProvider);
+    final storage = ref.watch(driveStorageProvider);
     final tailscale = ref.watch(tailscaleConnectionProvider);
-    final ready = github.isConnected && google.value != null;
+    final ready = github.isConnected && google.value != null && storage != null;
     final theme = Theme.of(context);
     return Scaffold(
       body: DecoratedBox(
@@ -37,55 +39,31 @@ class ConnectPage extends ConsumerWidget {
                   const SizedBox(height: AppSpace.xl),
                   FadeSlideIn(
                     index: 0,
-                    child: _ServiceCard(
+                    child: _ServiceTile(
                       icon: Icons.code_rounded,
                       title: context.tr('connect.github.title'),
-                      body: github.isConnected
-                          ? context.tr('connect.connectedAs', args: {'name': github.active!.login})
-                          : context.tr('connect.github.body'),
-                      isRequired: true,
                       connected: github.isConnected,
+                      statusText: github.isConnected
+                          ? '@${github.active!.login}'
+                          : context.tr('connect.notConnected'),
+                      requirement: context.tr('connect.required'),
                       actionLabel: github.isConnected ? context.tr('action.manage') : context.tr('action.connect'),
                       onAction: () => github.isConnected ? context.push('/accounts') : showGitHubSignIn(context),
                     ),
                   ),
                   const SizedBox(height: AppSpace.md),
-                  FadeSlideIn(
-                    index: 1,
-                    child: _ServiceCard(
-                      icon: Icons.cloud_done_outlined,
-                      title: context.tr('connect.drive.title'),
-                      body: google.isLoading
-                          ? context.tr('common.loading')
-                          : google.value != null
-                              ? context.tr('connect.connectedAs', args: {'name': google.value!.email})
-                              : context.tr('connect.drive.body'),
-                      isRequired: true,
-                      connected: google.value != null,
-                      busy: google.isLoading,
-                      actionLabel: google.value != null ? context.tr('action.manage') : context.tr('action.connect'),
-                      onAction: () async {
-                        if (google.value != null) {
-                          context.push('/accounts');
-                          return;
-                        }
-                        await ref.read(googleAccountProvider.notifier).connect();
-                        final error = ref.read(googleAccountProvider).error;
-                        if (error != null && context.mounted) {
-                          showAppSnack(context, describeError(context, error), isError: true);
-                        }
-                      },
-                    ),
-                  ),
+                  FadeSlideIn(index: 1, child: const DriveCard()),
                   const SizedBox(height: AppSpace.md),
                   FadeSlideIn(
                     index: 2,
-                    child: _ServiceCard(
+                    child: _ServiceTile(
                       icon: Icons.hub_outlined,
                       title: context.tr('connect.tailscale.title'),
-                      body: tailscale.value != null ? context.tr('connect.tailscale.connected') : context.tr('connect.tailscale.body'),
-                      isRequired: false,
                       connected: tailscale.value != null,
+                      statusText: tailscale.value != null
+                          ? context.tr('connect.tailscale.connected')
+                          : context.tr('connect.optionalStatus'),
+                      requirement: context.tr('connect.optional'),
                       actionLabel: tailscale.value != null ? context.tr('action.manage') : context.tr('action.connect'),
                       onAction: () => tailscale.value != null ? context.push('/accounts') : showTailscaleSheet(context),
                     ),
@@ -108,30 +86,29 @@ class ConnectPage extends ConsumerWidget {
   }
 }
 
-class _ServiceCard extends StatelessWidget {
-  const _ServiceCard({
+class _ServiceTile extends StatelessWidget {
+  const _ServiceTile({
     required this.icon,
     required this.title,
-    required this.body,
-    required this.isRequired,
     required this.connected,
+    required this.statusText,
+    required this.requirement,
     required this.actionLabel,
     required this.onAction,
-    this.busy = false,
   });
 
   final IconData icon;
   final String title;
-  final String body;
-  final bool isRequired;
   final bool connected;
-  final bool busy;
+  final String statusText;
+  final String requirement;
   final String actionLabel;
   final VoidCallback onAction;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final color = connected ? AppColors.success : AppColors.textMuted;
     return GlassCard(
       highlighted: connected,
       accent: AppColors.success,
@@ -151,24 +128,29 @@ class _ServiceCard extends StatelessWidget {
               ),
               const SizedBox(width: AppSpace.md),
               Expanded(child: Text(title, style: theme.textTheme.titleMedium)),
-              Text(
-                isRequired ? context.tr('connect.required') : context.tr('connect.optional'),
-                style: theme.textTheme.labelSmall,
-              ),
+              Text(requirement, style: theme.textTheme.labelSmall),
             ],
           ),
           const SizedBox(height: AppSpace.md),
-          Text(body, style: theme.textTheme.bodyMedium),
+          Row(
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+              ),
+              const SizedBox(width: AppSpace.sm),
+              Expanded(child: Text(statusText, style: theme.textTheme.bodyMedium)),
+            ],
+          ),
           const SizedBox(height: AppSpace.md),
           Align(
             alignment: AlignmentDirectional.centerEnd,
-            child: busy
-                ? const SizedBox.square(dimension: 22, child: CircularProgressIndicator(strokeWidth: 2.4))
-                : SecondaryButton(
-                    label: actionLabel,
-                    icon: connected ? Icons.tune_rounded : Icons.link_rounded,
-                    onPressed: onAction,
-                  ),
+            child: SecondaryButton(
+              label: actionLabel,
+              icon: connected ? Icons.tune_rounded : Icons.link_rounded,
+              onPressed: onAction,
+            ),
           ),
         ],
       ),

@@ -32,6 +32,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
+from http.client import HTTPException
 
 UA = "VoxelOps-Runner/1.1 (+https://github.com/abiedadam0077/Min2)"
 DRIVE = os.environ.get("VOXEL_DRIVE_API", "https://www.googleapis.com/drive/v3").rstrip("/")
@@ -91,9 +92,14 @@ def http(method, url, data=None, headers=None, timeout=120, stream_to=None):
             if stream_to:
                 tmp_path = stream_to + ".part"
                 os.makedirs(os.path.dirname(stream_to) or ".", exist_ok=True)
-                with open(tmp_path, "wb") as fh:
-                    shutil.copyfileobj(resp, fh, CHUNK)
-                os.replace(tmp_path, stream_to)
+                try:
+                    with open(tmp_path, "wb") as fh:
+                        shutil.copyfileobj(resp, fh, CHUNK)
+                    os.replace(tmp_path, stream_to)
+                except BaseException:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
                 return resp.status, dict(resp.headers), b""
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as err:
@@ -114,7 +120,7 @@ def retry(fn, attempts=5):
                 delay = min(delay * 2, 60)
                 continue
             raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException):
             if attempt < attempts:
                 time.sleep(delay)
                 delay = min(delay * 2, 60)
@@ -131,7 +137,11 @@ def md5_of(path):
 
 
 class Drive:
-    """Minimal Google Drive v3 client: listing, folders, downloads, multipart and resumable uploads."""
+    """Minimal Google Drive v3 client: listing, folders, downloads, multipart and resumable uploads.
+
+    Access tokens are refreshed from the stored refresh token. A 401 during a long run triggers one
+    refresh and a retry. Downloads go to a temporary file and replace the target only when complete.
+    """
 
     def __init__(self):
         self.client_id = env("GDRIVE_CLIENT_ID", required=True)
@@ -139,16 +149,22 @@ class Drive:
         self._token = None
         self._expires = 0.0
 
-    def _access(self, force=False):
-        if self._token and not force and time.time() < self._expires - 60:
+    def _access(self):
+        if self._token and time.time() < self._expires - 60:
             return self._token
         body = urllib.parse.urlencode({
             "client_id": self.client_id,
             "refresh_token": self.refresh_token,
             "grant_type": "refresh_token",
         }).encode()
-        _, _, raw = retry(lambda: http("POST", TOKEN_URL, data=body,
-                                       headers={"Content-Type": "application/x-www-form-urlencoded"}))
+        try:
+            _, _, raw = retry(lambda: http("POST", TOKEN_URL, data=body,
+                                           headers={"Content-Type": "application/x-www-form-urlencoded"}))
+        except HttpError as error:
+            if b"invalid_grant" in (error.body or b""):
+                raise RuntimeError("Google Drive access was revoked or has expired. Reconnect Google Drive "
+                                   "in the VoxelOps app, then start the server again.") from None
+            raise
         payload = json.loads(raw.decode())
         self._token = payload["access_token"]
         self._expires = time.time() + int(payload.get("expires_in", 3000))
@@ -159,10 +175,21 @@ class Drive:
         headers.update(extra or {})
         return headers
 
+    def _call(self, fn):
+        """Runs fn, which builds its own auth header. A 401 means the access token expired: refresh once."""
+        try:
+            return retry(fn)
+        except HttpError as error:
+            if error.status != 401:
+                raise
+            self._token = None
+            self._expires = 0.0
+            return retry(fn)
+
     def json_call(self, method, url, payload=None):
         data = None if payload is None else json.dumps(payload).encode()
-        headers = self._auth({"Content-Type": "application/json; charset=UTF-8"} if data else {})
-        _, _, raw = retry(lambda: http(method, url, data=data, headers=headers))
+        extra = {"Content-Type": "application/json; charset=UTF-8"} if data else None
+        _, _, raw = self._call(lambda: http(method, url, data=data, headers=self._auth(extra)))
         return json.loads(raw.decode()) if raw else {}
 
     @staticmethod
@@ -206,20 +233,22 @@ class Drive:
 
     def download_to(self, file_id, path):
         url = f"{DRIVE}/files/{file_id}?alt=media"
-        retry(lambda: http("GET", url, headers=self._auth(), timeout=900, stream_to=path))
+        self._call(lambda: http("GET", url, headers=self._auth(), timeout=900, stream_to=path))
 
     def download_bytes(self, file_id):
         url = f"{DRIVE}/files/{file_id}?alt=media"
-        _, _, raw = retry(lambda: http("GET", url, headers=self._auth(), timeout=300))
+        _, _, raw = self._call(lambda: http("GET", url, headers=self._auth(), timeout=300))
         return raw
 
     def read_json(self, parent, name):
+        """Returns the parsed JSON object, or None when the file does not exist or is not JSON.
+        Network and authorization errors propagate, so callers never overwrite data they could not read."""
         found = self.find(parent, name)
         if not found:
             return None
         try:
             return json.loads(self.download_bytes(found["id"]).decode())
-        except (ValueError, HttpError):
+        except ValueError:
             return None
 
     def write_bytes(self, parent, name, data, mime, file_id=None):
@@ -250,8 +279,8 @@ class Drive:
     def _simple_write(self, parent, name, data, mime, file_id):
         if file_id:
             url = f"{UPLOAD}/files/{file_id}?uploadType=media&fields=id,md5Checksum"
-            _, _, raw = retry(lambda: http("PATCH", url, data=data,
-                                           headers=self._auth({"Content-Type": mime}), timeout=300))
+            _, _, raw = self._call(lambda: http("PATCH", url, data=data,
+                                                headers=self._auth({"Content-Type": mime}), timeout=300))
             return json.loads(raw.decode())
         boundary = "voxelops" + str(random.randrange(10 ** 12))
         meta = json.dumps({"name": name, "parents": [parent], "mimeType": mime}).encode()
@@ -261,11 +290,44 @@ class Drive:
             f"\r\n--{boundary}--".encode(),
         ])
         url = f"{UPLOAD}/files?uploadType=multipart&fields=id,md5Checksum"
-        headers = self._auth({"Content-Type": f"multipart/related; boundary={boundary}"})
-        _, _, raw = retry(lambda: http("POST", url, data=body, headers=headers, timeout=300))
+        _, _, raw = self._call(lambda: http("POST", url, data=body,
+                                            headers=self._auth({"Content-Type": f"multipart/related; boundary={boundary}"}),
+                                            timeout=300))
         return json.loads(raw.decode())
 
+    def _start_session(self, method, url, meta, mime, total):
+        def open_session():
+            headers = self._auth({"Content-Type": "application/json; charset=UTF-8",
+                                  "X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(total)})
+            req = urllib.request.Request(url, data=meta, method=method)
+            req.add_header("User-Agent", UA)
+            for key, value in headers.items():
+                req.add_header(key, value)
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    return resp.headers.get("Location")
+            except urllib.error.HTTPError as error:
+                raise HttpError(error.code, error.read()[:2000]) from None
+        location = self._call(open_session)
+        if not location:
+            raise RuntimeError("Drive did not return a resumable upload session")
+        return location
+
+    def _resume_offset(self, location, total, fallback):
+        """Asks Drive how many bytes it already stored. Returns (offset, final_json_or_None)."""
+        try:
+            status, hdrs, raw = http("PUT", location, data=b"",
+                                     headers={"Content-Range": f"bytes */{total}", "Content-Length": "0"},
+                                     timeout=120)
+        except (HttpError, urllib.error.URLError, TimeoutError, ConnectionError, HTTPException):
+            return fallback, None
+        if status == 308:
+            received = hdrs.get("Range")
+            return (int(received.split("-")[-1]) + 1 if received else 0), None
+        return total, (json.loads(raw.decode()) if raw else {})
+
     def _resumable(self, parent, name, mime, file_id, total, read_chunk):
+        """Resumable upload in 8 MiB chunks. A dropped connection resumes from the last byte Drive stored."""
         if file_id:
             url = f"{UPLOAD}/files/{file_id}?uploadType=resumable&fields=id,md5Checksum"
             method, meta = "PATCH", b"{}"
@@ -273,17 +335,8 @@ class Drive:
             url = f"{UPLOAD}/files?uploadType=resumable&fields=id,md5Checksum"
             method = "POST"
             meta = json.dumps({"name": name, "parents": [parent], "mimeType": mime}).encode()
-        headers = self._auth({"Content-Type": "application/json; charset=UTF-8",
-                              "X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(total)})
-        req = urllib.request.Request(url, data=meta, method=method)
-        req.add_header("User-Agent", UA)
-        for key, value in headers.items():
-            req.add_header(key, value)
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            location = resp.headers.get("Location")
-        if not location:
-            raise RuntimeError("Drive did not return a resumable upload session")
-        offset = 0
+        location = self._start_session(method, url, meta, mime, total)
+        offset, failures = 0, 0
         while True:
             end = min(offset + CHUNK, total)
             chunk = read_chunk(offset, end) if total else b""
@@ -292,14 +345,21 @@ class Drive:
                 status, hdrs, raw = http("PUT", location, data=chunk,
                                          headers={"Content-Range": range_header, "Content-Type": mime},
                                          timeout=600)
-            except HttpError as err:
-                if err.status in (429, 500, 502, 503, 504):
-                    time.sleep(3)
-                    continue
-                raise
+            except (HttpError, urllib.error.URLError, TimeoutError, ConnectionError, HTTPException) as error:
+                if isinstance(error, HttpError) and error.status not in (429, 500, 502, 503, 504):
+                    raise
+                failures += 1
+                if failures > 8:
+                    raise RuntimeError(f"upload of {name} kept failing: {error}") from None
+                time.sleep(min(2 ** failures, 60))
+                offset, final = self._resume_offset(location, total, fallback=offset)
+                if final is not None:
+                    return final
+                continue
             if status == 308:
                 received = hdrs.get("Range")
                 offset = int(received.split("-")[-1]) + 1 if received else end
+                failures = 0
                 continue
             return json.loads(raw.decode())
 
@@ -464,7 +524,11 @@ class Runner:
         self.server_cache = self.drive.ensure_folder(self.folder, "server")
 
     def refresh_runtime(self):
-        data = self.drive.read_json(self.control, "runtime.json")
+        try:
+            data = self.drive.read_json(self.control, "runtime.json")
+        except (HttpError, OSError, RuntimeError, urllib.error.URLError, HTTPException) as error:
+            log(f"Could not read runtime settings, keeping the current ones: {error}")
+            data = None
         if isinstance(data, dict):
             self.runtime.update({k: v for k, v in data.items() if k in self.runtime})
         self.last_runtime = time.time()
@@ -488,7 +552,7 @@ class Runner:
             "runId": self.run_id,
             "lastBackupAt": self.last_backup,
             "lastSyncAt": self.last_sync,
-            "runnerVersion": "1.1",
+            "runnerVersion": "1.2",
         }
         self.drive.write_bytes(self.control, "status.json", json.dumps(status), "application/json")
         self.last_status = time.time()
@@ -504,14 +568,18 @@ class Runner:
         for item in items:
             try:
                 command = json.loads(self.drive.download_bytes(item["id"]).decode())
-            except (ValueError, HttpError):
+            except ValueError:
+                command = {}  # unreadable command file: discard it
+            except (HttpError, OSError, urllib.error.URLError, HTTPException):
+                continue  # transient failure: keep the command queued and retry on the next poll
+            if not isinstance(command, dict):
                 command = {}
             kind = str(command.get("type", ""))
             payload = command.get("payload") or {}
             log(f"Command received: {kind}")
             try:
                 self.handle(kind, payload)
-            except (HttpError, OSError, RuntimeError, zipfile.BadZipFile) as error:
+            except Exception as error:  # a failing command must never stop the runner
                 self.server.last_error = f"Command {kind} failed: {error}"[:300]
                 log(self.server.last_error)
             self.drive.trash(item["id"])
@@ -558,10 +626,15 @@ class Runner:
         last_error = None
         for attempt in range(3):
             try:
+                if attempt > 0:
+                    # A failed attempt may already have created or updated the file: look again first.
+                    remote = self.drive.find(parent, name)
+                    if remote and remote.get("md5Checksum") == digest:
+                        return
                 result = self.drive.write_path(parent, name, local, mime, file_id=remote["id"] if remote else None)
                 verify_upload(result, digest, name)
                 return
-            except (HttpError, OSError, RuntimeError, urllib.error.URLError) as error:
+            except (HttpError, OSError, RuntimeError, urllib.error.URLError, HTTPException) as error:
                 last_error = error
                 time.sleep(2 * (attempt + 1))
         raise RuntimeError(f"could not upload {name}: {last_error}")
@@ -605,13 +678,16 @@ class Runner:
                 self.push_dir(folder)
             self.last_sync = now_iso()
             self.sync_state = "idle"
-            meta = self.drive.read_json(self.folder, "metadata.json") or {}
-            meta["lastSyncAt"] = self.last_sync
-            if self.last_backup:
-                meta["lastBackupAt"] = self.last_backup
-            self.drive.write_bytes(self.folder, "metadata.json", json.dumps(meta, indent=2), "application/json")
+            meta = self.drive.read_json(self.folder, "metadata.json")
+            if isinstance(meta, dict):
+                meta["lastSyncAt"] = self.last_sync
+                if self.last_backup:
+                    meta["lastBackupAt"] = self.last_backup
+                self.drive.write_bytes(self.folder, "metadata.json", json.dumps(meta, indent=2), "application/json")
+            else:
+                log("metadata.json could not be read, so it was left unchanged.")
             log("Sync complete.")
-        except (HttpError, OSError, RuntimeError, urllib.error.URLError, ValueError) as error:
+        except (HttpError, OSError, RuntimeError, urllib.error.URLError, HTTPException, ValueError) as error:
             self.sync_state = "error"
             self.server.last_error = f"Sync failed, will retry: {error}"[:300]
             log(self.server.last_error)
@@ -658,7 +734,14 @@ class Runner:
         name = f"{kind}-{stamp}.zip"
         path = os.path.join(TMP, name)
         self.sync_state = "backup"
+        paused = False
         try:
+            if self.server.alive():
+                # Freeze autosave while the archive is written so region files are not copied mid-write.
+                self.flush()
+                self.server.send("save-off")
+                paused = True
+                time.sleep(2)
             with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
                 for folder in WORLD_DIRS:
                     base = os.path.join(ROOT, folder)
@@ -676,10 +759,12 @@ class Runner:
             if kind == "auto":
                 self.prune_backups()
             log(f"Backup {name} uploaded and verified.")
-        except (HttpError, OSError, RuntimeError, urllib.error.URLError, zipfile.BadZipFile) as error:
+        except (HttpError, OSError, RuntimeError, urllib.error.URLError, HTTPException, zipfile.BadZipFile) as error:
             self.server.last_error = f"Backup failed: {error}"[:300]
             log(self.server.last_error)
         finally:
+            if paused and self.server.alive():
+                self.server.send("save-on")
             if os.path.exists(path):
                 os.remove(path)
             self.sync_state = "idle"
@@ -905,7 +990,11 @@ class Runner:
                 code = self.server.exit_code
                 log(f"The server exited with code {code}.")
                 self.sync_up()
-                if code not in (0, None) and self.restarts < 3:
+                if code in (0, None):
+                    # Stopped from the console: Minecraft saved the world on its way out. Keep a backup.
+                    self.make_backup("auto")
+                    break
+                if self.restarts < 3:
                     self.restarts += 1
                     time.sleep(20)
                     self.launch()

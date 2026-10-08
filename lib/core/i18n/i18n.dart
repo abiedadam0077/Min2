@@ -35,6 +35,8 @@ String describeError(BuildContext context, Object error) {
       AppErrorKind.notConfigured => 'error.notConfigured',
       AppErrorKind.server => 'error.server',
       AppErrorKind.cancelled => 'error.cancelled',
+      AppErrorKind.signInFailed => 'error.signInFailed',
+      AppErrorKind.sessionExpired => 'error.sessionExpired',
       AppErrorKind.unknown => 'error.unknown',
     };
     return context.tr(key);

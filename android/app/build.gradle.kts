@@ -4,11 +4,23 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// Google OAuth (AppAuth, PKCE) requires a reverse-client-id redirect scheme that is
-// injected into the manifest at build time. CI derives it from GOOGLE_OAUTH_CLIENT_ID.
+// Google OAuth (AppAuth, PKCE) returns to the reversed client ID of the Android OAuth client:
+//   GOOGLE_OAUTH_CLIENT_ID = <prefix>.apps.googleusercontent.com
+//   redirect scheme        = com.googleusercontent.apps.<prefix>
+// The app computes the same scheme in Dart (AppConfig.googleRedirectScheme) from the same client ID,
+// so the manifest placeholder and the redirect URI can never drift apart. Local builds pass the
+// client ID as an environment variable or as a Gradle property.
+val googleClientId: String =
+    (System.getenv("GOOGLE_OAUTH_CLIENT_ID") ?: (findProperty("GOOGLE_OAUTH_CLIENT_ID") as? String) ?: "")
+        .trim()
+val googleClientSuffix = ".apps.googleusercontent.com"
 val googleRedirectScheme: String =
-    System.getenv("GOOGLE_REDIRECT_SCHEME")?.takeIf { it.isNotBlank() }
-        ?: "com.voxelops.oauth.unconfigured"
+    if (googleClientId.endsWith(googleClientSuffix)) {
+        "com.googleusercontent.apps." + googleClientId.removeSuffix(googleClientSuffix)
+    } else {
+        // Unconfigured build: AppAuth cannot complete sign-in, and the app reports that as a friendly error.
+        "com.voxelops.oauth.unconfigured"
+    }
 
 // Release signing is optional: when the keystore variables are present (CI secrets) the
 // release APK is signed with the stable release key, otherwise the debug key is used.

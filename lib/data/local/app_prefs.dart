@@ -19,6 +19,8 @@ class AppPrefs {
   static const String _kGoogleAccount = 'pref.google.account.v1';
   static const String _kTailscaleTailnet = 'pref.tailscale.tailnet';
   static const String _kTailscaleConnected = 'pref.tailscale.connected';
+  static const String _kDriveRootId = 'pref.drive.root_id';
+  static const String _kDriveRootName = 'pref.drive.root_name';
 
   String get locale => _prefs.getString(_kLocale) ?? 'system';
 
@@ -104,6 +106,21 @@ class AppPrefs {
   bool get tailscaleConnected => _prefs.getBool(_kTailscaleConnected) ?? false;
 
   Future<void> setTailscaleConnected(bool value) => _prefs.setBool(_kTailscaleConnected, value);
+
+  /// Drive folder that holds every server (chosen during Server Storage setup).
+  String? get driveRootId => _prefs.getString(_kDriveRootId);
+
+  String? get driveRootName => _prefs.getString(_kDriveRootName);
+
+  Future<void> setDriveRoot(String? id, String? name) async {
+    if (id == null || id.isEmpty) {
+      await _prefs.remove(_kDriveRootId);
+      await _prefs.remove(_kDriveRootName);
+      return;
+    }
+    await _prefs.setString(_kDriveRootId, id);
+    await _prefs.setString(_kDriveRootName, name ?? 'Minecraft Servers');
+  }
 
   List<Map<String, dynamic>> _readList(String key) {
     final raw = _prefs.getString(key);

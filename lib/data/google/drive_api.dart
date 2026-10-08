@@ -2,11 +2,19 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:http/http.dart' as http;
+
 import '../../core/errors/app_exception.dart';
 import '../../core/net/api_client.dart';
 import '../../domain/integration_models.dart';
 
-/// Google Drive v3 REST client. Works only with files created by this app (drive.file).
+/// Returns a bearer token. With forceRefresh the stored refresh token is used even if the cached token looks valid.
+typedef DriveAccessToken = Future<String> Function({bool forceRefresh});
+
+/// Google Drive v3 client. Works on files and folders created by this app (drive.file scope).
+///
+/// Every request goes through [_send]: when Drive answers 401 the access token is refreshed once and the
+/// request is repeated, so an expired access token never reaches the user as an error.
 class DriveApi {
   DriveApi(this._api, this._accessToken);
 
@@ -19,19 +27,37 @@ class DriveApi {
   static const int chunkSize = 8 * 1024 * 1024;
 
   final ApiClient _api;
-  final Future<String> Function() _accessToken;
-
-  Future<Map<String, String>> _auth() async => {'Authorization': 'Bearer ${await _accessToken()}'};
+  final DriveAccessToken _accessToken;
 
   static String escapeQuery(String value) => value.replaceAll(r'\', r'\\').replaceAll("'", r"\'");
 
+  Future<http.Response> _send(
+    String method,
+    Uri uri, {
+    Map<String, String>? headers,
+    Object? body,
+    Duration? timeout,
+    int maxRetries = 2,
+  }) async {
+    Future<http.Response> attempt(String token) => _api.send(
+          method,
+          uri,
+          headers: {...?headers, 'Authorization': 'Bearer $token'},
+          body: body,
+          timeout: timeout,
+          maxRetries: maxRetries,
+        );
+    final first = await attempt(await _accessToken());
+    if (first.statusCode != 401) {
+      return first;
+    }
+    return attempt(await _accessToken(forceRefresh: true));
+  }
+
   Future<DriveQuota> about() async {
-    final response = await _api.send(
+    final response = await _send(
       'GET',
-      Uri.parse('$_base/about').replace(queryParameters: {
-        'fields': 'user(displayName,emailAddress),storageQuota(limit,usage)',
-      }),
-      headers: await _auth(),
+      Uri.parse('$_base/about').replace(queryParameters: {'fields': 'user(displayName,emailAddress),storageQuota(limit,usage)'}),
     );
     ApiClient.ensureSuccess(response, provider: _provider);
     final json = ApiClient.decodeObject(response, provider: _provider);
@@ -46,21 +72,19 @@ class DriveApi {
     );
   }
 
-  Future<List<DriveFile>> listChildren(String folderId, {bool includeTrashed = false}) async {
+  Future<List<DriveFile>> listChildren(String folderId) async {
     final files = <DriveFile>[];
     String? pageToken;
     do {
-      final query = "'${escapeQuery(folderId)}' in parents and trashed = ${includeTrashed ? 'true' : 'false'}";
-      final response = await _api.send(
+      final response = await _send(
         'GET',
         Uri.parse('$_base/files').replace(queryParameters: {
-          'q': query,
+          'q': "'${escapeQuery(folderId)}' in parents and trashed = false",
           'fields': 'nextPageToken,files($_fileFields)',
           'pageSize': '1000',
           'orderBy': 'folder,name',
           if (pageToken != null) 'pageToken': pageToken,
         }),
-        headers: await _auth(),
       );
       ApiClient.ensureSuccess(response, provider: _provider);
       final json = ApiClient.decodeObject(response, provider: _provider);
@@ -73,6 +97,25 @@ class DriveApi {
     return files;
   }
 
+  /// Folders this app can see (created by VoxelOps). Used by the Server Storage picker.
+  Future<List<DriveFile>> listFolders() async {
+    final response = await _send(
+      'GET',
+      Uri.parse('$_base/files').replace(queryParameters: {
+        'q': "mimeType = '$folderMime' and trashed = false",
+        'fields': 'files($_fileFields)',
+        'pageSize': '100',
+        'orderBy': 'name',
+      }),
+    );
+    ApiClient.ensureSuccess(response, provider: _provider);
+    final items = ApiClient.decodeObject(response, provider: _provider)['files'];
+    if (items is! List<dynamic>) {
+      return const <DriveFile>[];
+    }
+    return items.whereType<Map<String, dynamic>>().map(DriveFile.fromJson).toList();
+  }
+
   Future<DriveFile?> findChild(String parentId, String name, {String? mimeType}) async {
     final clauses = <String>[
       "'${escapeQuery(parentId)}' in parents",
@@ -80,14 +123,13 @@ class DriveApi {
       'trashed = false',
       if (mimeType != null) "mimeType = '${escapeQuery(mimeType)}'",
     ];
-    final response = await _api.send(
+    final response = await _send(
       'GET',
       Uri.parse('$_base/files').replace(queryParameters: {
         'q': clauses.join(' and '),
         'fields': 'files($_fileFields)',
         'pageSize': '10',
       }),
-      headers: await _auth(),
     );
     ApiClient.ensureSuccess(response, provider: _provider);
     final items = ApiClient.decodeObject(response, provider: _provider)['files'];
@@ -98,10 +140,9 @@ class DriveApi {
   }
 
   Future<DriveFile> getFile(String fileId) async {
-    final response = await _api.send(
+    final response = await _send(
       'GET',
       Uri.parse('$_base/files/$fileId').replace(queryParameters: {'fields': _fileFields}),
-      headers: await _auth(),
     );
     ApiClient.ensureSuccess(response, provider: _provider);
     return DriveFile.fromJson(ApiClient.decodeObject(response, provider: _provider));
@@ -116,10 +157,9 @@ class DriveApi {
   }
 
   Future<DriveFile> createFolder(String parentId, String name) async {
-    final response = await _api.send(
+    final response = await _send(
       'POST',
       Uri.parse('$_base/files').replace(queryParameters: {'fields': _fileFields}),
-      headers: await _auth(),
       body: <String, Object?>{
         'name': name,
         'mimeType': folderMime,
@@ -131,10 +171,9 @@ class DriveApi {
   }
 
   Future<Uint8List> download(String fileId) async {
-    final response = await _api.send(
+    final response = await _send(
       'GET',
       Uri.parse('$_base/files/$fileId').replace(queryParameters: {'alt': 'media'}),
-      headers: await _auth(),
       timeout: const Duration(minutes: 3),
     );
     ApiClient.ensureSuccess(response, provider: _provider);
@@ -146,7 +185,7 @@ class DriveApi {
     return utf8.decode(bytes, allowMalformed: true);
   }
 
-  /// Creates [name] inside [parentId], or replaces the content if a file with that name exists.
+  /// Creates [name] inside [parentId], or replaces the content when a file with that name exists.
   Future<DriveFile> upsertBytes({
     required String parentId,
     required String name,
@@ -184,14 +223,12 @@ class DriveApi {
       ..add(utf8.encode('\r\n--$boundary\r\nContent-Type: $mimeType\r\n\r\n'))
       ..add(data)
       ..add(utf8.encode('\r\n--$boundary--'));
-    final response = await _api.send(
+    final response = await _send(
       'POST',
       Uri.parse('$_uploadBase/files').replace(queryParameters: {'uploadType': 'multipart', 'fields': _fileFields}),
-      headers: {
-        ...await _auth(),
-        'Content-Type': 'multipart/related; boundary=$boundary',
-      },
+      headers: {'Content-Type': 'multipart/related; boundary=$boundary'},
       body: body.takeBytes(),
+      timeout: const Duration(minutes: 2),
     );
     ApiClient.ensureSuccess(response, provider: _provider);
     return DriveFile.fromJson(ApiClient.decodeObject(response, provider: _provider));
@@ -209,10 +246,10 @@ class DriveApi {
         readChunk: (start, end) async => Uint8List.sublistView(data, start, end),
       );
     }
-    final response = await _api.send(
+    final response = await _send(
       'PATCH',
       Uri.parse('$_uploadBase/files/$fileId').replace(queryParameters: {'uploadType': 'media', 'fields': _fileFields}),
-      headers: {...await _auth(), 'Content-Type': mimeType},
+      headers: {'Content-Type': mimeType},
       body: data,
       timeout: const Duration(minutes: 2),
     );
@@ -221,7 +258,12 @@ class DriveApi {
   }
 
   /// Uploads a local file in 8 MiB chunks so large worlds never sit fully in memory.
-  Future<DriveFile> uploadLocalFile({required String parentId, required String name, required File file, required String mimeType}) async {
+  Future<DriveFile> uploadLocalFile({
+    required String parentId,
+    required String name,
+    required File file,
+    required String mimeType,
+  }) async {
     final total = await file.length();
     final raf = await file.open();
     try {
@@ -241,6 +283,8 @@ class DriveApi {
     }
   }
 
+  /// Resumable protocol: start a session, then send Content-Range chunks. Google answers 308 until the
+  /// last byte arrives. Each chunk is retried on transient failures and verified by the final response.
   Future<DriveFile> _resumable({
     required String method,
     required Uri url,
@@ -249,11 +293,10 @@ class DriveApi {
     required int total,
     required Future<Uint8List> Function(int start, int end) readChunk,
   }) async {
-    final startResponse = await _api.send(
+    final start = await _send(
       method,
       url,
       headers: {
-        ...await _auth(),
         'Content-Type': 'application/json; charset=UTF-8',
         'X-Upload-Content-Type': mimeType,
         'X-Upload-Content-Length': '$total',
@@ -261,12 +304,11 @@ class DriveApi {
       body: metadata ?? <String, Object?>{},
       timeout: const Duration(seconds: 60),
     );
-    ApiClient.ensureSuccess(startResponse, provider: _provider);
-    final location = startResponse.headers['location'];
+    ApiClient.ensureSuccess(start, provider: _provider);
+    final location = start.headers['location'];
     if (location == null || location.isEmpty) {
       throw const AppException(AppErrorKind.server, 'Google Drive did not return an upload session.');
     }
-    var offset = 0;
     if (total == 0) {
       final empty = await _api.send(
         'PUT',
@@ -278,51 +320,45 @@ class DriveApi {
       ApiClient.ensureSuccess(empty, provider: _provider);
       return DriveFile.fromJson(ApiClient.decodeObject(empty, provider: _provider));
     }
+    var offset = 0;
     while (offset < total) {
       final end = (offset + chunkSize < total) ? offset + chunkSize : total;
       final chunk = await readChunk(offset, end);
       final response = await _api.send(
         'PUT',
         Uri.parse(location),
-        headers: {
-          'Content-Range': 'bytes $offset-${end - 1}/$total',
-          'Content-Type': mimeType,
-        },
+        headers: {'Content-Range': 'bytes $offset-${end - 1}/$total', 'Content-Type': mimeType},
         body: chunk,
         timeout: const Duration(minutes: 3),
         maxRetries: 3,
       );
       if (response.statusCode == 308) {
-        final range = response.headers['range'];
-        final acknowledged = range == null ? end : (int.tryParse(range.split('-').last) ?? (end - 1)) + 1;
-        offset = acknowledged;
+        final received = response.headers['range'];
+        offset = received == null ? end : (int.tryParse(received.split('-').last) ?? (end - 1)) + 1;
         continue;
       }
       ApiClient.ensureSuccess(response, provider: _provider);
       return DriveFile.fromJson(ApiClient.decodeObject(response, provider: _provider));
     }
-    throw const AppException(AppErrorKind.server, 'Upload finished without a file response.');
+    throw const AppException(AppErrorKind.server, 'The upload finished without a file response.');
   }
 
   Future<void> rename(String fileId, String newName) async {
-    final response = await _api.send(
+    final response = await _send(
       'PATCH',
       Uri.parse('$_base/files/$fileId').replace(queryParameters: {'fields': _fileFields}),
-      headers: await _auth(),
       body: <String, Object?>{'name': newName},
     );
     ApiClient.ensureSuccess(response, provider: _provider);
   }
 
-  /// Moves a file to Drive trash. Recoverable from trash for 30 days.
+  /// Moves a file to Drive trash, where it stays recoverable for 30 days.
   Future<void> trash(String fileId) async {
-    final response = await _api.send(
+    final response = await _send(
       'PATCH',
       Uri.parse('$_base/files/$fileId').replace(queryParameters: {'fields': 'id'}),
-      headers: await _auth(),
       body: <String, Object?>{'trashed': true},
     );
     ApiClient.ensureSuccess(response, provider: _provider);
   }
-
 }

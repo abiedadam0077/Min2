@@ -1,14 +1,21 @@
-/// Google Drive folder layout for one server:
+/// Google Drive layout for one server (stable, documented, recoverable):
 ///
-/// MinecraftServers/<Name>/
-///   metadata.json, server.properties, eula.txt, server-icon.png, README.txt
-///   server/        server software cache (server jar), restored before every start
-///   world/ world_nether/ world_the_end/
-///   mods/ plugins/ config/
-///   backups/       zip backups created by the runner or the app
-///   logs/          archived console logs per run
-///   imports/       uploaded world archives waiting to be applied
-///   control/       runtime.json, status.json, live.log and commands/ (app -> runner queue)
+/// Minecraft Servers/                      <- storage root chosen by the user
+///   NovaCraft/                            <- one folder per server
+///     metadata.json                       name, software, Minecraft version, repository, timestamps
+///     server.properties                   Minecraft settings (edited by the app)
+///     eula.txt                            accepted when the server was created
+///     server-icon.png                     optional 64x64 icon
+///     README.txt                          what each folder is for
+///     server/                             server software cache (for example the server jar)
+///     world/  world_nether/  world_the_end/
+///     mods/  plugins/  config/
+///     backups/                            zip backups (automatic, manual, pre-restore, imported)
+///     _voxelops/                          system folder used by the app and the runner
+///       control/status.json, runtime.json, live.log
+///       control/commands/                 one JSON file per command from the app
+///       logs/                             one log file per run
+///       imports/                          world archives waiting to be applied
 abstract final class DriveLayout {
   static const String server = 'server';
   static const String world = 'world';
@@ -18,10 +25,12 @@ abstract final class DriveLayout {
   static const String plugins = 'plugins';
   static const String config = 'config';
   static const String backups = 'backups';
-  static const String logs = 'logs';
-  static const String imports = 'imports';
+
+  static const String system = '_voxelops';
   static const String control = 'control';
   static const String commands = 'commands';
+  static const String logs = 'logs';
+  static const String imports = 'imports';
 
   static const String metadataFile = 'metadata.json';
   static const String propertiesFile = 'server.properties';
@@ -34,17 +43,6 @@ abstract final class DriveLayout {
 
   static const List<String> worldFolders = <String>[world, worldNether, worldEnd];
 
-  static const List<String> topFolders = <String>[
-    server,
-    world,
-    worldNether,
-    worldEnd,
-    mods,
-    plugins,
-    config,
-    backups,
-    logs,
-    imports,
-    control,
-  ];
+  /// Folders created at the top level of every server folder.
+  static const List<String> topFolders = <String>[server, world, worldNether, worldEnd, mods, plugins, config, backups];
 }

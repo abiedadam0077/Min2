@@ -50,7 +50,7 @@ No client secret is compiled into the APK. Android backups are disabled (`allowB
 
 ## Google Drive as the source of truth
 
-Each server lives at `MinecraftServers/<Name>/` (see `DriveLayout`). Recovery needs only the Drive folder and a GitHub repository:
+Each server lives at `Minecraft Servers/<Name>/` (the storage root is configurable; system files live in `_voxelops/`) (see `DriveLayout`). Recovery needs only the Drive folder and a GitHub repository:
 
 1. `Import existing server` lists folders that contain `metadata.json`.
 2. `attachToRepository` reads metadata, writes the workflow and runner, and re-creates the secrets in the chosen repository.

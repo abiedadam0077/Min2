@@ -16,7 +16,7 @@ Synthesised principles: calm dark surfaces, one primary action per card, state a
 
 ## 2. Platform and API facts
 
-- **GitHub Actions terms.** Actions may be used to develop and test applications. Using hosted runners for unrelated activity is prohibited. Running a continuous Minecraft server on GitHub-hosted runners is likely outside the permitted use. VoxelOps keeps hosted runners as the default because the brief asks for it, shows a required acknowledgement in the wizard, and supports a user-owned runner through `runs-on`.
+- **GitHub Actions terms.** Actions may be used to develop and test applications. Using hosted runners for unrelated activity is prohibited. Running a continuous Minecraft server on GitHub-hosted runners is likely outside the permitted use. VoxelOps runs servers only on GitHub-hosted runners (ubuntu-latest), shows the terms to the user, requires an acknowledgement in the wizard, and keeps every world and backup in Google Drive so that a suspended repository never removes player data. No self-hosted or VPS option exists.
 - **GitHub secrets.** Secrets must be encrypted with the repository public key (libsodium sealed box). VoxelOps uses `pinenacl` 0.6.0 `SealedBox`. The test suite decrypts a PyNaCl-generated vector to confirm compatibility.
 - **GitHub device flow** (RFC 8628) needs no client secret, so the APK can ship without secrets. Personal access tokens are accepted as a fallback.
 - **Google Drive `drive.file` scope** limits access to files the app creates. Refresh tokens are stored in Android Keystore-backed storage. Google may expire refresh tokens for apps in "Testing" status after seven days (**unverified** for this client; publish the consent screen or re-consent when this happens).

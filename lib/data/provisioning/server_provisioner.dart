@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import '../../core/config/app_config.dart';
 import '../../core/errors/app_exception.dart';
+import '../../core/storage/secure_store.dart';
 import '../../domain/integration_models.dart';
 import '../../domain/server_draft.dart';
 import '../../domain/server_models.dart';
@@ -12,12 +13,11 @@ import '../local/app_prefs.dart';
 import '../minecraft/server_properties.dart';
 import '../minecraft/version_catalog.dart';
 import '../minecraft/workflow_template.dart';
-import '../../core/storage/secure_store.dart';
 import 'drive_layout.dart';
 
 typedef ProvisionProgress = void Function(String step, double fraction);
 
-/// A folder under MinecraftServers that contains a VoxelOps metadata.json.
+/// A server folder under the storage root that contains a VoxelOps metadata.json.
 class DiscoveredServer {
   const DiscoveredServer({required this.folderId, required this.folderName, required this.record});
 
@@ -54,27 +54,57 @@ class ServerProvisioner {
     return 'voxelops-${base.length > 60 ? base.substring(0, 60) : base}';
   }
 
+  /// Returns the storage root ("Minecraft Servers" by default). With [create] false it never creates anything.
+  Future<String?> storageRootId({bool create = true}) async {
+    final saved = prefs.driveRootId;
+    if (saved != null && saved.isNotEmpty) {
+      return saved;
+    }
+    final name = prefs.driveRootName ?? AppConfig.driveRootFolder;
+    final existing = await drive.findChild('root', name, mimeType: DriveApi.folderMime);
+    if (existing != null) {
+      await prefs.setDriveRoot(existing.id, existing.name);
+      return existing.id;
+    }
+    if (!create) {
+      return null;
+    }
+    final created = await drive.createFolder('root', name);
+    await prefs.setDriveRoot(created.id, created.name);
+    return created.id;
+  }
+
+  /// Creates a new storage root (or reuses a folder with the same name that VoxelOps already owns).
+  Future<DriveFile> createStorageRoot(String name) async {
+    final cleaned = name.trim().isEmpty ? AppConfig.driveRootFolder : name.trim();
+    final folder = await drive.ensureFolder('root', cleaned);
+    await prefs.setDriveRoot(folder.id, folder.name);
+    return folder;
+  }
+
+  /// Uses a folder that the app can already see (created by VoxelOps) as the storage root.
+  Future<void> chooseStorageRoot(DriveFile folder) async {
+    if (!folder.isFolder) {
+      throw const AppException(AppErrorKind.validation, 'Choose a folder, not a file.');
+    }
+    await prefs.setDriveRoot(folder.id, folder.name);
+  }
+
   Future<ServerRecord> create(ServerDraft draft, {required ProvisionProgress onProgress}) async {
     _validateDraft(draft);
     onProgress('resolve', 0.05);
     final build = draft.build ?? await versions.resolve(draft.software, draft.minecraftVersion);
     final user = await github.currentUser();
-    final googleLinked = await store.read(SecureKeys.googleRefreshToken);
-    if (googleLinked == null || googleLinked.isEmpty) {
+    final refresh = await store.read(SecureKeys.googleRefreshToken);
+    if (refresh == null || refresh.isEmpty) {
       throw const AppException(AppErrorKind.notConfigured, 'Connect Google Drive before creating a server.');
     }
 
     onProgress('drive', 0.15);
-    final root = await drive.ensureFolder('root', AppConfig.driveRootFolder);
-    final folderName = await _uniqueFolderName(root.id, draft.name.trim());
-    final serverFolder = await drive.createFolder(root.id, folderName);
-    final folderIds = <String, String>{};
-    final contentFolder = draft.software.supportsContent ? draft.software.contentFolder : null;
-    for (final name in <String>{...DriveLayout.topFolders, if (contentFolder != null) contentFolder}) {
-      folderIds[name] = (await drive.createFolder(serverFolder.id, name)).id;
-    }
-    final commandsFolder = await drive.createFolder(folderIds[DriveLayout.control]!, DriveLayout.commands);
-    folderIds[DriveLayout.commands] = commandsFolder.id;
+    final rootId = await storageRootId() ?? (throw const AppException(AppErrorKind.server, 'Server storage is not ready.'));
+    final folderName = await _uniqueFolderName(rootId, draft.name.trim());
+    final serverFolder = await drive.createFolder(rootId, folderName);
+    final tree = await _createServerTree(serverFolder.id);
 
     final id = _newId();
     final now = DateTime.now();
@@ -92,10 +122,9 @@ class ServerProvisioner {
       createdAt: now,
       tailscaleHostname: null,
       githubAccountLogin: user.login,
-      runnerLabel: draft.runnerLabel,
     );
 
-    final properties = ServerPropertiesFile.withDefaults(levelName: 'world')..applySettings(draft.settings);
+    final properties = ServerPropertiesFile.withDefaults(levelName: DriveLayout.world)..applySettings(draft.settings);
     await drive.upsertBytes(
       parentId: serverFolder.id,
       name: DriveLayout.propertiesFile,
@@ -109,12 +138,7 @@ class ServerProvisioner {
       mimeType: 'text/plain',
     );
     if (draft.iconBytes != null) {
-      await drive.upsertBytes(
-        parentId: serverFolder.id,
-        name: DriveLayout.iconFile,
-        bytes: draft.iconBytes!,
-        mimeType: 'image/png',
-      );
+      await drive.upsertBytes(parentId: serverFolder.id, name: DriveLayout.iconFile, bytes: draft.iconBytes!, mimeType: 'image/png');
     }
     await drive.upsertBytes(
       parentId: serverFolder.id,
@@ -123,17 +147,19 @@ class ServerProvisioner {
       mimeType: 'text/plain',
     );
     await drive.upsertBytes(
-      parentId: folderIds[DriveLayout.control]!,
+      parentId: tree.control,
       name: DriveLayout.runtimeFile,
-      bytes: utf8.encode(jsonEncode(draft.runtime.toJson())),
+      bytes: utf8.encode(JsonEncoder.withIndent('  ').convert(draft.runtime.toJson())),
       mimeType: 'application/json',
     );
     await drive.upsertBytes(
-      parentId: folderIds[DriveLayout.control]!,
+      parentId: tree.control,
       name: DriveLayout.statusFile,
       bytes: utf8.encode(jsonEncode(_offlineStatus())),
       mimeType: 'application/json',
     );
+    // Written before GitHub is touched, so the server can be recovered even if a later step fails.
+    await _writeMetadata(record);
 
     onProgress('github', 0.4);
     final repoName = draft.repoName.trim();
@@ -172,13 +198,13 @@ class ServerProvisioner {
     return record;
   }
 
-  /// Lists every server folder in Drive that carries VoxelOps metadata.
+  /// Lists every server folder under the storage root that carries VoxelOps metadata.
   Future<List<DiscoveredServer>> discover() async {
-    final root = await drive.findChild('root', AppConfig.driveRootFolder, mimeType: DriveApi.folderMime);
-    if (root == null) {
+    final rootId = await storageRootId(create: false);
+    if (rootId == null) {
       return const <DiscoveredServer>[];
     }
-    final folders = (await drive.listChildren(root.id)).where((f) => f.isFolder).toList();
+    final folders = (await drive.listChildren(rootId)).where((f) => f.isFolder).toList();
     final result = <DiscoveredServer>[];
     for (final folder in folders) {
       final metadataFile = await drive.findChild(folder.id, DriveLayout.metadataFile);
@@ -187,11 +213,13 @@ class ServerProvisioner {
       }
       try {
         final json = _decodeObject(await drive.downloadText(metadataFile.id));
+        final repoFull = json['githubRepo'] as String? ?? '';
+        final parts = repoFull.split('/');
         final record = ServerRecord.fromDriveMetadata(
           json,
           driveFolderId: folder.id,
-          repoOwner: (json['githubRepo'] as String? ?? '').split('/').first,
-          repoName: (json['githubRepo'] as String? ?? '').split('/').length > 1 ? (json['githubRepo'] as String).split('/')[1] : '',
+          repoOwner: parts.isNotEmpty ? parts.first : '',
+          repoName: parts.length > 1 ? parts[1] : '',
         );
         result.add(DiscoveredServer(folderId: folder.id, folderName: folder.name, record: record));
       } on AppException {
@@ -203,11 +231,14 @@ class ServerProvisioner {
     return result;
   }
 
-  /// Attaches a Drive server to a repository (new account, new repo or a repaired workflow).
+  /// Attaches a Drive server to a repository: a new account, a new repository, or a repaired workflow.
+  /// When [createRepository] is true the repository is created when it does not exist yet.
   Future<ServerRecord> attachToRepository({
     required String driveFolderId,
     required String repoOwner,
     required String repoName,
+    bool createRepository = false,
+    bool repoPrivate = true,
   }) async {
     final metadataFile = await drive.findChild(driveFolderId, DriveLayout.metadataFile);
     if (metadataFile == null) {
@@ -215,7 +246,14 @@ class ServerProvisioner {
     }
     final json = _decodeObject(await drive.downloadText(metadataFile.id));
     final user = await github.currentUser();
-    final repo = await github.getRepository(repoOwner, repoName);
+    // Never reuses an existing repository silently: writing a workflow into the wrong repo is destructive.
+    final GitHubRepo repo = createRepository
+        ? await github.createRepository(
+            name: repoName,
+            isPrivate: repoPrivate,
+            description: 'VoxelOps Minecraft server: ${json['name'] ?? ''}',
+          )
+        : await github.getRepository(repoOwner, repoName);
     var record = ServerRecord.fromDriveMetadata(
       json,
       driveFolderId: driveFolderId,
@@ -226,7 +264,6 @@ class ServerProvisioner {
     final runtime = await _readRuntime(driveFolderId);
     await _writeRepositoryFiles(record, runtime: runtime, branch: repo.defaultBranch, tailscaleEnabled: prefs.tailscaleConnected);
     await _writeSecrets(record, tailscaleEnabled: prefs.tailscaleConnected);
-    record = record.copyWith(githubAccountLogin: user.login);
     await _writeMetadata(record);
     final others = prefs.servers().where((s) => s.id != record.id).toList();
     await prefs.saveServers([...others, record]);
@@ -241,12 +278,33 @@ class ServerProvisioner {
     await _writeSecrets(record, tailscaleEnabled: prefs.tailscaleConnected);
   }
 
+  /// Creates the per-server folder tree. Returns the ids the rest of the provisioning needs.
+  Future<_ServerTree> _createServerTree(String serverFolderId) async {
+    final ids = <String, String>{};
+    for (final name in DriveLayout.topFolders) {
+      ids[name] = (await drive.createFolder(serverFolderId, name)).id;
+    }
+    final system = await drive.createFolder(serverFolderId, DriveLayout.system);
+    final control = await drive.createFolder(system.id, DriveLayout.control);
+    final commands = await drive.createFolder(control.id, DriveLayout.commands);
+    final logs = await drive.createFolder(system.id, DriveLayout.logs);
+    final imports = await drive.createFolder(system.id, DriveLayout.imports);
+    return _ServerTree(
+      topFolders: ids,
+      system: system.id,
+      control: control.id,
+      commands: commands.id,
+      logs: logs.id,
+      imports: imports.id,
+    );
+  }
+
   Future<RuntimeSettings> _readRuntime(String driveFolderId) async {
-    final control = await drive.findChild(driveFolderId, DriveLayout.control, mimeType: DriveApi.folderMime);
+    final control = await _controlFolderId(driveFolderId);
     if (control == null) {
       return const RuntimeSettings();
     }
-    final file = await drive.findChild(control.id, DriveLayout.runtimeFile);
+    final file = await drive.findChild(control, DriveLayout.runtimeFile);
     if (file == null) {
       return const RuntimeSettings();
     }
@@ -257,6 +315,15 @@ class ServerProvisioner {
     } on FormatException {
       return const RuntimeSettings();
     }
+  }
+
+  Future<String?> _controlFolderId(String driveFolderId) async {
+    final system = await drive.findChild(driveFolderId, DriveLayout.system, mimeType: DriveApi.folderMime);
+    if (system == null) {
+      return null;
+    }
+    final control = await drive.findChild(system.id, DriveLayout.control, mimeType: DriveApi.folderMime);
+    return control?.id;
   }
 
   Future<void> _writeRepositoryFiles(
@@ -289,6 +356,10 @@ class ServerProvisioner {
   }
 
   Future<void> _writeSecrets(ServerRecord record, {required bool tailscaleEnabled}) async {
+    final refresh = await store.read(SecureKeys.googleRefreshToken);
+    if (refresh == null || refresh.isEmpty) {
+      throw const AppException(AppErrorKind.notConfigured, 'Google Drive is not connected.');
+    }
     final key = await github.actionsPublicKey(record.repoOwner, record.repoName);
     Future<void> put(String name, String value) async {
       await github.putActionsSecret(
@@ -300,10 +371,6 @@ class ServerProvisioner {
       );
     }
 
-    final refresh = await store.read(SecureKeys.googleRefreshToken);
-    if (refresh == null || refresh.isEmpty) {
-      throw const AppException(AppErrorKind.notConfigured, 'Google Drive is not connected.');
-    }
     await put('VOXEL_DRIVE_FOLDER_ID', record.driveFolderId);
     await put('GDRIVE_CLIENT_ID', AppConfig.googleClientId);
     await put('GDRIVE_REFRESH_TOKEN', refresh);
@@ -382,28 +449,47 @@ class ServerProvisioner {
 VoxelOps server: $name
 
 This folder is managed by the VoxelOps app and the GitHub Actions runner.
-- Do not rename world folders while the server is running.
-- server.properties and mods/plugins changes take effect on the next start.
-- control/ is the command queue used by the app. Do not delete it.
+- server.properties, mods/, plugins/ and config/ take effect on the next start.
+- world/, world_nether/ and world_the_end/ are saved by the runner during a run and before every stop.
 - backups/ contains zip archives. They can be restored from the app.
+- _voxelops/ is the system folder: control/ (commands and status), logs/ and imports/.
+  Do not delete it while the server is in use.
 
-Recovery: install VoxelOps, connect the same Google account, and choose
+Recovery: install VoxelOps, sign in with the same Google account, and choose
 "Import existing server" to reconnect this folder to a GitHub repository.
 ''';
 
   static String _repoReadme(ServerRecord record) => '''
 # ${record.name}
 
-This repository runs a Minecraft server with VoxelOps.
+This repository runs a Minecraft server with VoxelOps on GitHub-hosted runners.
 
 - Workflow: .github/workflows/${AppConfig.workflowFileName}
 - Runner: ${AppConfig.runnerRepoPath}
-- World, configuration and backups are stored in Google Drive (MinecraftServers/${record.name}).
+- World, configuration and backups are stored in Google Drive (${AppConfig.driveRootFolder}/${record.name}).
 - Secrets (Drive folder ID, Drive refresh token, optional Tailscale OAuth) are stored as Actions secrets.
 - Minecraft version: ${record.minecraftVersion} (${record.software.label}).
 
 Do not commit world data to this repository.
 ''';
+}
+
+class _ServerTree {
+  const _ServerTree({
+    required this.topFolders,
+    required this.system,
+    required this.control,
+    required this.commands,
+    required this.logs,
+    required this.imports,
+  });
+
+  final Map<String, String> topFolders;
+  final String system;
+  final String control;
+  final String commands;
+  final String logs;
+  final String imports;
 }
 
 ServerRecord? findServer(List<ServerRecord> servers, String id) {

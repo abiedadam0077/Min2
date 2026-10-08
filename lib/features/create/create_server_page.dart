@@ -40,7 +40,6 @@ class _CreateServerPageState extends ConsumerState<CreateServerPage> {
   final _motd = TextEditingController();
   final _seed = TextEditingController();
   final _versionSearch = TextEditingController();
-  final _runnerLabel = TextEditingController();
   String _channel = 'release';
   String? _error;
 
@@ -52,7 +51,6 @@ class _CreateServerPageState extends ConsumerState<CreateServerPage> {
     _description.text = draft.description;
     _motd.text = draft.settings.motd;
     _seed.text = draft.settings.levelSeed;
-    _runnerLabel.text = draft.runnerLabel;
   }
 
   @override
@@ -62,7 +60,6 @@ class _CreateServerPageState extends ConsumerState<CreateServerPage> {
     _motd.dispose();
     _seed.dispose();
     _versionSearch.dispose();
-    _runnerLabel.dispose();
     super.dispose();
   }
 
@@ -129,7 +126,6 @@ class _CreateServerPageState extends ConsumerState<CreateServerPage> {
           name: _name.text.trim(),
           description: _description.text.trim(),
           settings: d.settings.copyWith(motd: _motd.text.trim().isEmpty ? 'A VoxelOps server' : _motd.text.trim(), levelSeed: _seed.text.trim()),
-          runnerLabel: _runnerLabel.text.trim().isEmpty ? 'ubuntu-latest' : _runnerLabel.text.trim(),
         ));
   }
 
@@ -493,11 +489,6 @@ class _CreateServerPageState extends ConsumerState<CreateServerPage> {
           ),
         ),
         const SizedBox(height: AppSpace.md),
-        TextField(
-          controller: _runnerLabel,
-          decoration: InputDecoration(labelText: context.tr('create.repo.runner'), helperText: context.tr('create.repo.runnerHint')),
-        ),
-        const SizedBox(height: AppSpace.md),
         GlassCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -582,7 +573,7 @@ class _CreateServerPageState extends ConsumerState<CreateServerPage> {
                       ),
               ),
               InfoLine(label: context.tr('create.review.repo'), value: draft.repoFullName),
-              InfoLine(label: context.tr('create.review.runner'), value: draft.runnerLabel),
+              InfoLine(label: context.tr('create.review.runner'), value: context.tr('actions.runner')),
               InfoLine(label: context.tr('create.review.players'), value: '${draft.settings.maxPlayers}'),
             ],
           ),

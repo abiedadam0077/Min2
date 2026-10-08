@@ -12,6 +12,8 @@ enum AppErrorKind {
   notConfigured,
   server,
   cancelled,
+  signInFailed,
+  sessionExpired,
   unknown,
 }
 

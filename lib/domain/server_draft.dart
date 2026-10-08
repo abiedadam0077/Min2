@@ -20,7 +20,6 @@ class ServerDraft {
     this.repoName = '',
     this.createRepository = true,
     this.repoPrivate = true,
-    this.runnerLabel = 'ubuntu-latest',
   });
 
   final String name;
@@ -38,7 +37,6 @@ class ServerDraft {
   final String repoName;
   final bool createRepository;
   final bool repoPrivate;
-  final String runnerLabel;
 
   String get repoFullName => repoOwner.isEmpty || repoName.isEmpty ? '' : '$repoOwner/$repoName';
 
@@ -59,7 +57,6 @@ class ServerDraft {
     String? repoName,
     bool? createRepository,
     bool? repoPrivate,
-    String? runnerLabel,
   }) {
     return ServerDraft(
       name: name ?? this.name,
@@ -77,7 +74,6 @@ class ServerDraft {
       repoName: repoName ?? this.repoName,
       createRepository: createRepository ?? this.createRepository,
       repoPrivate: repoPrivate ?? this.repoPrivate,
-      runnerLabel: runnerLabel ?? this.runnerLabel,
     );
   }
 }

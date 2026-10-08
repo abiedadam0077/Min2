@@ -13,6 +13,7 @@ import '../features/content/content_page.dart';
 import '../features/create/create_server_page.dart';
 import '../features/create/creation_progress_page.dart';
 import '../features/create/repo_picker_page.dart';
+import '../features/drive/drive_storage_page.dart';
 import '../features/dashboard/server_dashboard_page.dart';
 import '../features/files/file_editor_page.dart';
 import '../features/files/file_manager_page.dart';
@@ -55,6 +56,7 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(path: '/creating', pageBuilder: (c, s) => fadeRisePage(key: s.pageKey, child: const CreationProgressPage())),
       GoRoute(path: '/import', pageBuilder: (c, s) => fadeRisePage(key: s.pageKey, child: const ImportServerPage())),
       GoRoute(path: '/accounts', pageBuilder: (c, s) => fadeRisePage(key: s.pageKey, child: const AccountsPage())),
+      GoRoute(path: '/drive/storage', pageBuilder: (c, s) => fadeRisePage(key: s.pageKey, child: const DriveStoragePage())),
       GoRoute(path: '/notifications', pageBuilder: (c, s) => fadeRisePage(key: s.pageKey, child: const NotificationsPage())),
       GoRoute(
         path: '/server/:id',
@@ -116,7 +118,7 @@ String? _redirect(Ref ref, String path) {
     return null;
   }
   final driveConnected = google.value != null;
-  const setupRoutes = <String>{'/welcome', '/connect', '/accounts'};
+  const setupRoutes = <String>{'/welcome', '/connect', '/accounts', '/drive/storage'};
   if ((!github || !driveConnected) && !setupRoutes.contains(path)) {
     return '/connect';
   }

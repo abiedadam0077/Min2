@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../core/config/app_config.dart';
 import '../../core/i18n/i18n.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/theme/app_tokens.dart';
@@ -102,6 +103,7 @@ class ServerDashboardPage extends ConsumerWidget {
             ],
           ),
         ),
+        _ActionsCard(record: record, state: status.state, runs: runs),
         _Controls(record: record, running: running, busy: busy, status: status),
         SectionTitle(title: context.tr('dashboard.actions')),
         Row(
@@ -289,6 +291,90 @@ class _Controls extends ConsumerWidget {
           },
         ),
       ],
+    );
+  }
+}
+
+/// GitHub Actions status for this server: Ready, Running, Queued, Stopping or Not started,
+/// with links to the workflow and to the logs of the latest run. Start, stop and restart are below.
+class _ActionsCard extends StatelessWidget {
+  const _ActionsCard({required this.record, required this.state, required this.runs});
+
+  final ServerRecord record;
+  final ServerState state;
+  final AsyncValue<List<GitHubRun>> runs;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final items = runs.value ?? const <GitHubRun>[];
+    final latest = items.isEmpty ? null : items.first;
+    final repoBase = 'https://github.com/${record.repoOwner}/${record.repoName}';
+    final workflowUrl = Uri.parse('$repoBase/actions/workflows/${AppConfig.workflowFileName}');
+    final logsUrl = (latest != null && latest.htmlUrl.isNotEmpty) ? Uri.parse(latest.htmlUrl) : Uri.parse('$repoBase/actions');
+
+    final String label;
+    final Color color;
+    if (state == ServerState.stopping) {
+      label = context.tr('actions.stopping');
+      color = AppColors.warning;
+    } else if (latest == null) {
+      label = context.tr('actions.notStarted');
+      color = AppColors.textMuted;
+    } else if (latest.isActive) {
+      final queued = latest.status == 'queued' || latest.status == 'waiting' || latest.status == 'pending' || latest.status == 'requested';
+      label = queued ? context.tr('actions.queued') : context.tr('actions.running');
+      color = queued ? AppColors.warning : AppColors.success;
+    } else {
+      label = context.tr('actions.ready');
+      color = AppColors.primary;
+    }
+
+    return GlassCard(
+      accent: color,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.play_circle_outline_rounded, color: color),
+              const SizedBox(width: AppSpace.sm),
+              Expanded(child: Text(context.tr('actions.title'), style: theme.textTheme.titleSmall)),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpace.sm, vertical: AppSpace.xs),
+                decoration: BoxDecoration(color: color.withValues(alpha: 0.16), borderRadius: AppRadius.all(AppRadius.pill)),
+                child: Text(label, style: theme.textTheme.labelSmall?.copyWith(color: color)),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpace.sm),
+          Text(context.tr('actions.runner'), style: theme.textTheme.bodySmall),
+          if (latest != null) ...[
+            const SizedBox(height: AppSpace.xs),
+            Text('#${latest.runNumber} · ${latest.title}', style: theme.textTheme.bodySmall, maxLines: 1, overflow: TextOverflow.ellipsis),
+          ],
+          const SizedBox(height: AppSpace.md),
+          Row(
+            children: [
+              Expanded(
+                child: SecondaryButton(
+                  label: context.tr('actions.viewWorkflow'),
+                  icon: Icons.account_tree_outlined,
+                  onPressed: () => launchUrl(workflowUrl, mode: LaunchMode.externalApplication),
+                ),
+              ),
+              const SizedBox(width: AppSpace.sm),
+              Expanded(
+                child: SecondaryButton(
+                  label: context.tr('actions.viewLogs'),
+                  icon: Icons.receipt_long_outlined,
+                  onPressed: () => launchUrl(logsUrl, mode: LaunchMode.externalApplication),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

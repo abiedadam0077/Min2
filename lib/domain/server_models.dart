@@ -234,7 +234,6 @@ class ServerRecord {
     required this.createdAt,
     this.tailscaleHostname,
     this.githubAccountLogin,
-    this.runnerLabel = 'ubuntu-latest',
     this.lastBackupAt,
     this.lastSyncAt,
   });
@@ -252,7 +251,6 @@ class ServerRecord {
   final DateTime createdAt;
   final String? tailscaleHostname;
   final String? githubAccountLogin;
-  final String runnerLabel;
   final DateTime? lastBackupAt;
   final DateTime? lastSyncAt;
 
@@ -264,7 +262,6 @@ class ServerRecord {
     String? loaderVersion,
     String? tailscaleHostname,
     String? githubAccountLogin,
-    String? runnerLabel,
     DateTime? lastBackupAt,
     DateTime? lastSyncAt,
     String? repoOwner,
@@ -285,7 +282,6 @@ class ServerRecord {
       createdAt: createdAt,
       tailscaleHostname: tailscaleHostname ?? this.tailscaleHostname,
       githubAccountLogin: githubAccountLogin ?? this.githubAccountLogin,
-      runnerLabel: runnerLabel ?? this.runnerLabel,
       lastBackupAt: lastBackupAt ?? this.lastBackupAt,
       lastSyncAt: lastSyncAt ?? this.lastSyncAt,
     );
@@ -305,7 +301,6 @@ class ServerRecord {
         'createdAt': createdAt.toUtc().toIso8601String(),
         'tailscaleHostname': tailscaleHostname,
         'githubAccountLogin': githubAccountLogin,
-        'runnerLabel': runnerLabel,
         'lastBackupAt': lastBackupAt?.toUtc().toIso8601String(),
         'lastSyncAt': lastSyncAt?.toUtc().toIso8601String(),
       };
@@ -325,13 +320,12 @@ class ServerRecord {
       createdAt: DateTime.tryParse(_str(json['createdAt']) ?? '')?.toLocal() ?? DateTime.now(),
       tailscaleHostname: _str(json['tailscaleHostname']),
       githubAccountLogin: _str(json['githubAccountLogin']),
-      runnerLabel: _str(json['runnerLabel']) ?? 'ubuntu-latest',
       lastBackupAt: DateTime.tryParse(_str(json['lastBackupAt']) ?? '')?.toLocal(),
       lastSyncAt: DateTime.tryParse(_str(json['lastSyncAt']) ?? '')?.toLocal(),
     );
   }
 
-  /// Metadata written to Drive at MinecraftServers/<Name>/metadata.json.
+  /// Metadata written to Drive at Minecraft Servers/<Name>/metadata.json.
   Map<String, Object?> toDriveMetadata() => {
         'schema': 1,
         'id': id,

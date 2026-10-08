@@ -9,6 +9,7 @@ import '../../core/widgets/feedback.dart';
 import '../../core/widgets/shell.dart';
 import '../../state/auth_providers.dart';
 import '../connect/connect_sheets.dart';
+import '../drive/drive_card.dart';
 
 /// Account switching and service management: GitHub accounts, Google Drive, Tailscale, CurseForge.
 class AccountsPage extends ConsumerWidget {
@@ -17,7 +18,6 @@ class AccountsPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final github = ref.watch(githubAccountsProvider);
-    final google = ref.watch(googleAccountProvider);
     final tailscale = ref.watch(tailscaleConnectionProvider);
     final curseForge = ref.watch(curseForgeKeyPresentProvider);
     return AppPage(
@@ -74,53 +74,7 @@ class AccountsPage extends ConsumerWidget {
           ],
         ),
         SectionTitle(title: context.tr('accounts.drive')),
-        GlassCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                google.value?.email ?? context.tr('connect.drive.body'),
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-              const SizedBox(height: AppSpace.md),
-              Row(
-                children: [
-                  Expanded(
-                    child: google.value == null
-                        ? PrimaryButton(
-                            label: context.tr('action.connect'),
-                            busy: google.isLoading,
-                            onPressed: () async {
-                              await ref.read(googleAccountProvider.notifier).connect();
-                              final error = ref.read(googleAccountProvider).error;
-                              if (error != null && context.mounted) {
-                                showAppSnack(context, describeError(context, error), isError: true);
-                              }
-                            },
-                          )
-                        : SecondaryButton(
-                            label: context.tr('accounts.disconnect'),
-                            icon: Icons.link_off_rounded,
-                            danger: true,
-                            onPressed: () async {
-                              final ok = await confirmAction(
-                                context,
-                                title: context.tr('accounts.disconnectDriveTitle'),
-                                message: context.tr('accounts.disconnectDriveBody'),
-                                confirmLabel: context.tr('accounts.disconnect'),
-                                destructive: true,
-                              );
-                              if (ok) {
-                                await ref.read(googleAccountProvider.notifier).disconnect();
-                              }
-                            },
-                          ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
+        const DriveCard(),
         SectionTitle(title: context.tr('accounts.tailscale')),
         GlassCard(
           child: Column(
