@@ -1,0 +1,10 @@
+/.gradle
+/captures/
+/local.properties
+GeneratedPluginRegistrant.java
+.cxx/
+
+# Signing material must never be committed.
+key.properties
+**/*.keystore
+**/*.jks
