@@ -1,6 +1,8 @@
 name: Diagnose token permissions
 
 on:
+  push:
+    branches: [arena/1e2cf108-min2]
   workflow_dispatch:
 
 permissions:
