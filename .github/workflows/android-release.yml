@@ -18,7 +18,6 @@ concurrency:
 env:
   FLUTTER_VERSION: "3.47.6"
   JAVA_VERSION: "17"
-  RELEASE_BRANCHES: "arena/1e2cf108-min2 main"
 
 jobs:
   verify:
@@ -41,17 +40,28 @@ jobs:
       - name: Resolve dependencies
         run: flutter pub get
       - name: Static analysis
-        run: flutter analyze
+        id: analyze
+        run: |
+          set -o pipefail
+          flutter analyze 2>&1 | tee analyze.log
+      - name: Annotate analyzer findings
+        if: failure() && steps.analyze.outcome == 'failure'
+        run: python3 tool/ci_annotate.py analyze analyze.log
       - name: Unit and widget tests
-        run: flutter test
+        id: test
+        run: |
+          set -o pipefail
+          flutter test --reporter expanded 2>&1 | tee test.log
+      - name: Annotate test failures
+        if: failure() && steps.test.outcome == 'failure'
+        run: python3 tool/ci_annotate.py test test.log
 
   build:
     name: Build release APK
-    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -92,6 +102,7 @@ jobs:
           echo "ANDROID_KEYSTORE_PATH=${KEYSTORE_PATH}" >> "$GITHUB_ENV"
 
       - name: Build release APK
+        id: build
         env:
           GOOGLE_OAUTH_CLIENT_ID: ${{ vars.GOOGLE_OAUTH_CLIENT_ID }}
           GITHUB_OAUTH_CLIENT_ID: ${{ vars.GITHUB_OAUTH_CLIENT_ID }}
@@ -100,13 +111,17 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           APP_VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          set -euo pipefail
+          set -o pipefail
           flutter pub get
           flutter build apk --release \
             --dart-define=GOOGLE_OAUTH_CLIENT_ID="${GOOGLE_OAUTH_CLIENT_ID:-}" \
             --dart-define=GITHUB_OAUTH_CLIENT_ID="${GITHUB_OAUTH_CLIENT_ID:-}" \
             --dart-define=APP_VERSION="${APP_VERSION}" \
-            --dart-define=APP_BUILD="${GITHUB_RUN_NUMBER}"
+            --dart-define=APP_BUILD="${GITHUB_RUN_NUMBER}" 2>&1 | tee build.log
+
+      - name: Annotate build failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: python3 tool/ci_annotate.py build build.log
 
       - name: Collect artifacts
         run: |
@@ -124,21 +139,33 @@ jobs:
           path: dist/
           retention-days: 30
 
+  release:
+    name: Publish release
+    needs: [verify, build]
+    if: github.event_name == 'push' && (github.ref_name == 'arena/1e2cf108-min2' || github.ref_name == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: voxelops-apk-${{ github.run_number }}
+          path: dist
       - name: Publish GitHub release
-        if: github.event_name == 'push' && contains(env.RELEASE_BRANCHES, github.ref_name)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
-          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: v${{ needs.build.outputs.version }}-build.${{ github.run_number }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           NOTES="VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER}) built from commit ${GITHUB_SHA} on branch ${GITHUB_REF_NAME}.
 
-          Install: download VoxelOps.apk and open it on your Android phone (Android 7.0 or newer).
+          Install: download VoxelOps.apk and open it on an Android phone (Android 7.0 or newer).
           Verify: compare the SHA-256 in SHA256SUMS.txt."
           if gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "VoxelOps ${VERSION} (build ${GITHUB_RUN_NUMBER})" --notes "$NOTES" --latest; then
             echo "Published release ${TAG}."
           else
-            echo "Release creation failed; attempting to upload assets to existing tag." >&2
+            echo "Release creation failed; uploading assets to the existing tag." >&2
             gh release upload "$TAG" dist/* --clobber
           fi
