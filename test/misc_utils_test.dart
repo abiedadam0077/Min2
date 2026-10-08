@@ -42,7 +42,7 @@ void main() {
   test('runner asset ships with the app and exposes the command protocol', () {
     final text = File('assets/runtime/voxelops_runner.py').readAsStringSync();
     expect(text, contains('save-all flush'));
-    expect(text, contains("'control'"));
+    expect(text, contains('"control"'));
     expect(text, contains('def main():'));
     expect(text, isNot(contains('GDRIVE_REFRESH_TOKEN =')));
   });

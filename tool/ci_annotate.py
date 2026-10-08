@@ -51,11 +51,11 @@ def main() -> int:
         index = 0
         while index < len(lines) and emitted < MAX:
             line = lines[index]
-            if re.search(r"What went wrong|FAILURE: Build failed|^e: |Error: |Exception:|error:|\.dart:\d+:\d+: Error", line):
-                tail = " | ".join(part.strip() for part in lines[index: index + 3] if part.strip())
+            if re.search(r"What went wrong|Execution failed for task|^e: |Error: |Exception:|\.dart:\d+:\d+: Error|FAILURE: Build failed", line):
+                tail = " | ".join(part.strip() for part in lines[index: index + 7] if part.strip())
                 emit("error", tail)
                 emitted += 1
-                index += 3
+                index += 7
                 continue
             index += 1
     print(f"Emitted {emitted} annotation(s) for {mode}.")
