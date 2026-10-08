@@ -49,6 +49,7 @@ jobs:
         run: python3 tool/ci_annotate.py analyze analyze.log
       - name: Unit and widget tests
         id: test
+        if: always()
         run: |
           set -o pipefail
           flutter test --reporter expanded 2>&1 | tee test.log

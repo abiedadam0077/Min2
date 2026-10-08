@@ -1,5 +1,3 @@
-import 'dart:typed_data';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -13,7 +11,6 @@ import '../../core/widgets/common.dart';
 import '../../core/widgets/feedback.dart';
 import '../../core/widgets/shell.dart';
 import '../../data/minecraft/server_icon.dart';
-import '../../data/minecraft/version_catalog.dart';
 import '../../domain/server_draft.dart';
 import '../../domain/server_models.dart';
 import '../../state/core_providers.dart';

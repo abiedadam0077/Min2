@@ -35,8 +35,8 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            if (releaseKeystorePath != null) {
+        if (releaseKeystorePath != null) {
+            create("release") {
                 storeFile = file(releaseKeystorePath)
                 storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
                 keyAlias = System.getenv("ANDROID_KEY_ALIAS")

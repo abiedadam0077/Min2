@@ -50,7 +50,7 @@ class _ContentPageState extends ConsumerState<ContentPage> {
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final active = ref.watch(activeServerProvider);
     if (active == null) {
       return AppPage(title: context.tr('content.title'), inShell: true, children: const [NoActiveServer()]);

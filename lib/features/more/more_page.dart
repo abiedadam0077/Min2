@@ -11,7 +11,6 @@ import '../../core/widgets/brand.dart';
 import '../../core/widgets/common.dart';
 import '../../core/widgets/shell.dart';
 import '../../state/app_providers.dart';
-import '../../state/auth_providers.dart';
 import '../../state/server_providers.dart';
 import '../connect/connect_sheets.dart';
 

@@ -67,7 +67,7 @@ class _ConsolePageState extends ConsumerState<ConsolePage> {
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final active = ref.watch(activeServerProvider);
     if (active == null) {
       return AppPage(title: context.tr('console.title'), inShell: true, children: const [NoActiveServer()]);

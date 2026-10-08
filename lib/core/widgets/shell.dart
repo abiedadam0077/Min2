@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
 import '../theme/app_tokens.dart';
-import 'common.dart';
 
 class NavItem {
   const NavItem({required this.icon, required this.selectedIcon, required this.label});
