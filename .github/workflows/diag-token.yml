@@ -1,0 +1,26 @@
+name: Diagnose token permissions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe release creation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          TAG="diag-${GITHUB_RUN_ID}"
+          RESP=$(gh api -i "repos/${GITHUB_REPOSITORY}/releases" -X POST -f tag_name="$TAG" -f name="diag" -F draft=true -f target_commitish="$GITHUB_SHA" 2>&1)
+          echo "$RESP" | head -c 1500
+          echo "::notice title=probe::$(echo "$RESP" | grep -i -E '^HTTP/|x-accepted-github-permissions|x-oauth-scopes|message' | tr '\r\n' '  ' | head -c 500)"
+          ID=$(echo "$RESP" | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -1)
+          if [ -n "$ID" ]; then gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/$ID" >/dev/null 2>&1 && echo "draft release deleted"; fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/$TAG" >/dev/null 2>&1
+          exit 0
