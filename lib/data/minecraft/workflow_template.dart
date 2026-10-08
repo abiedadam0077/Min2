@@ -57,7 +57,7 @@ class WorkflowTemplate {
     if (tailscaleEnabled) {
       buffer
         ..writeln('      - name: Join Tailscale')
-        ..writeln('        uses: tailscale/github-action@v3')
+        ..writeln('        uses: tailscale/github-action@v4')
         ..writeln('        with:')
         ..writeln('          oauth-client-id: \${{ secrets.TS_OAUTH_CLIENT_ID }}')
         ..writeln('          oauth-secret: \${{ secrets.TS_OAUTH_SECRET }}')
